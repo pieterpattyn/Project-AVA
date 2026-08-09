@@ -76,5 +76,22 @@ class HomeAssistantVerificationTests(unittest.TestCase):
         self.assertEqual(ava._candidate_score("Beneden binnen", state), 1.0)
 
 
+class ToolRoutingTests(unittest.TestCase):
+    def test_weather_turn_requires_tool(self):
+        self.assertTrue(ava._turn_likely_needs_tool("Wat is het weer bij mij?"))
+
+    def test_home_assistant_direct_control_requires_tool(self):
+        self.assertTrue(ava._turn_likely_needs_tool("Zet beneden binnen aan."))
+
+    def test_brightness_turn_requires_tool(self):
+        self.assertTrue(ava._turn_likely_needs_tool("Zet de helderheid op 40 procent."))
+
+    def test_current_time_requires_tool(self):
+        self.assertTrue(ava._turn_likely_needs_tool("Hoe laat is het?"))
+
+    def test_memory_question_stays_on_conversation_path(self):
+        self.assertFalse(ava._turn_likely_needs_tool("Wat is mijn favoriete kleur?"))
+
+
 if __name__ == "__main__":
     unittest.main()
