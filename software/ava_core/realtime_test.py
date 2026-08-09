@@ -1,10 +1,10 @@
 import asyncio
-import audioop
 import base64
 import queue
 import threading
 import time
 
+import numpy as np
 import sounddevice as sd
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -35,6 +35,21 @@ def find_microphone(name):
             print(f"Microphone: {device['name']} (device {index})")
             return index, device
     raise RuntimeError(f"Microphone containing '{name}' not found.")
+
+
+def resample_pcm16_mono(data, source_rate, target_rate):
+    if source_rate == target_rate:
+        return data
+
+    samples = np.frombuffer(data, dtype=np.int16)
+    if len(samples) < 2:
+        return data
+
+    target_length = max(1, round(len(samples) * target_rate / source_rate))
+    source_positions = np.arange(len(samples), dtype=np.float64)
+    target_positions = np.linspace(0, len(samples) - 1, target_length)
+    converted = np.interp(target_positions, source_positions, samples).astype(np.int16)
+    return converted.tobytes()
 
 
 class PCMPlayer:
@@ -111,7 +126,6 @@ async def main():
     mic_queue = asyncio.Queue(maxsize=100)
     last_speech_stopped = None
     first_audio_seen = False
-    rate_state = None
 
     def audio_callback(indata, frames, time_info, status):
         if status:
@@ -156,8 +170,6 @@ async def main():
         print("Connected. Listening...")
 
         async def send_microphone():
-            nonlocal rate_state
-
             with sd.RawInputStream(
                 samplerate=mic_rate,
                 blocksize=chunk_frames,
@@ -168,17 +180,7 @@ async def main():
             ):
                 while True:
                     data = await mic_queue.get()
-
-                    if mic_rate != API_SAMPLE_RATE:
-                        data, rate_state = audioop.ratecv(
-                            data,
-                            2,
-                            CHANNELS,
-                            mic_rate,
-                            API_SAMPLE_RATE,
-                            rate_state,
-                        )
-
+                    data = resample_pcm16_mono(data, mic_rate, API_SAMPLE_RATE)
                     encoded = base64.b64encode(data).decode("ascii")
                     await connection.input_audio_buffer.append(audio=encoded)
 
