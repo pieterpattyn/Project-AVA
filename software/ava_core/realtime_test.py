@@ -19,6 +19,11 @@ API_SAMPLE_RATE = 24000
 CHANNELS = 1
 CHUNK_MS = 20
 PLAYBACK_PREBUFFER_MS = 650
+TRANSCRIPTION_PROMPT = (
+    "Belgisch-Nederlands uit Vlaanderen. De assistent heet AVA. "
+    "Veel voorkomende aanspreekvormen zijn: 'Hey AVA', 'hoe is het met je?', "
+    "'wat bedoel je?', 'mijn vraag was'."
+)
 
 INSTRUCTIONS = """
 Je bent AVA, een persoonlijke slimme assistent.
@@ -77,8 +82,10 @@ def transcript_is_valid(text):
         return False
 
     ghost_markers = (
-        "belgisch-nederlands gesprek",
+        "belgisch-nederlands uit vlaanderen",
         "de assistent heet ava",
+        "veel voorkomende aanspreekvormen zijn",
+        "belgisch-nederlands gesprek",
         "de naam van de assistent is ava",
     )
     return not any(marker in normalized for marker in ghost_markers)
@@ -219,6 +226,7 @@ async def main():
                         "transcription": {
                             "model": "gpt-4o-transcribe",
                             "language": "nl",
+                            "prompt": TRANSCRIPTION_PROMPT,
                         },
                         "turn_detection": {
                             "type": "semantic_vad",
@@ -278,10 +286,6 @@ async def main():
                         print("Ignored ghost/empty transcription. Listening...")
                         continue
 
-                    # The realtime model consumes raw audio directly, while the
-                    # transcription service is separate. Add the validated transcript
-                    # as the authoritative latest user message so the response follows
-                    # what was actually recognized in Dutch.
                     await connection.conversation.item.create(
                         item={
                             "type": "message",
