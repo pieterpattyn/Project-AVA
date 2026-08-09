@@ -1,4 +1,4 @@
-"""Project AVA v1.0-rc1 - consolidated Realtime assistant.
+"""Project AVA v1.0 - consolidated Realtime assistant.
 
 Single production entry point for the proven v0.9.3 feature set:
 - OpenAI Realtime voice + avatar
@@ -7,6 +7,7 @@ Single production entry point for the proven v0.9.3 feature set:
 - Home Assistant discovery, state lookup, light/switch control
 - verified state and brightness feedback
 - serialized tool follow-up responses
+- deterministic silent tool routing before spoken follow-up
 
 The earlier v0.8/v0.9 wrapper files remain in the repository as historical
 checkpoints, but this module does not import or monkey-patch them.
@@ -40,7 +41,7 @@ from PySide6.QtQml import QQmlApplicationEngine
 import realtime_app as core
 
 
-VERSION = "1.0-rc1"
+VERSION = "1.0"
 CONTROL_DOMAINS = {"light", "switch"}
 MAX_ENTITY_RESULTS = 12
 VERIFY_TIMEOUT_SECONDS = 4.0
@@ -222,7 +223,7 @@ Gebruik home_assistant_control alleen voor lampen en schakelaars.
 Als verified=true, bevestig alleen waarden die door het toolresultaat bevestigd zijn.
 Als brightness_requested_pct aanwezig is maar brightness_verified=false, zeg dat het helderheidscommando aanvaard is maar nog niet bevestigd.
 Als command_accepted=true maar verified=false, zeg niet dat de bediening mislukt is. Zeg dat het commando is verstuurd maar dat statusbevestiging achterloopt.
-Roep een benodigde tool meteen aan zonder gesproken tussenzin zoals 'ik check even' of 'momentje'.
+Toolselectie gebeurt stil: geef nooit een gesproken tussenzin vóór een toolcall.
 Geef na het uiteindelijke toolresultaat één compact gesproken antwoord.
 Verzin nooit actuele informatie of een succesvolle apparaatstatus.
 """.strip()
@@ -643,6 +644,42 @@ def _normalise_name(value):
     return " ".join(text.split())
 
 
+def _turn_likely_needs_tool(transcript):
+    """High-precision local routing for turns that require current/device tools.
+
+    Tool turns start as text-only Realtime responses with tool_choice=required.
+    That makes tool selection silent by construction. Non-tool turns explicitly
+    disable tools and stay on the low-latency audio path.
+    """
+
+    text = _normalise_name(transcript)
+    if not text:
+        return False
+
+    patterns = (
+        r"\bhoe laat\b",
+        r"\bwelke (?:dag|datum)\b",
+        r"\bwat is (?:de )?datum\b",
+        r"\bdatum van vandaag\b",
+        r"\btijd in\b",
+        r"\bweer\b",
+        r"\bweers(?:verwachting|voorspelling)\b",
+        r"\bregent\b",
+        r"\bregen\b",
+        r"\bwind\b",
+        r"\btemperatuur buiten\b",
+        r"\bhoe warm\b.*\bbuiten\b",
+        r"\bhome assistant\b",
+        r"\bhelderheid\b",
+        r"\b(?:lamp|lampen|licht|lichten|schakelaar|schakelaars|switch|sensor|sensoren)\b",
+        r"\b(?:zet|doe|schakel|maak)\b.+\b(?:aan|uit)\b",
+        r"\bstaat\b.+\b(?:aan|uit)\b",
+        r"\bstatus van\b",
+        r"\btemperatuur (?:in|van) (?:de )?[a-z0-9]+\b",
+    )
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+
+
 def _entity_summary(state):
     attributes = state.get("attributes") or {}
     entity_id = str(state.get("entity_id") or "")
@@ -1004,6 +1041,7 @@ async def realtime_worker(bridge):
     turn_peak = 0.0
     pending_turns = deque()
     tool_followup_pending = False
+    current_turn_tool_mode = False
 
     def audio_callback(indata, frames, time_info, status):
         nonlocal turn_voice_blocks, turn_peak
@@ -1089,6 +1127,7 @@ async def realtime_worker(bridge):
         async def receive_events():
             nonlocal last_speech_stopped, first_audio_seen
             nonlocal turn_voice_blocks, turn_peak, tool_followup_pending
+            nonlocal current_turn_tool_mode
 
             async for event in connection:
                 if event.type == "input_audio_buffer.speech_started":
@@ -1164,13 +1203,23 @@ async def realtime_worker(bridge):
                             "content": [{"type": "input_text", "text": transcript}],
                         }
                     )
-                    await connection.response.create(
-                        response={
-                            "instructions": build_tool_instructions(
-                                memory, memory_actions
-                            )
-                        }
-                    )
+
+                    current_turn_tool_mode = _turn_likely_needs_tool(transcript)
+                    response_options = {
+                        "instructions": build_tool_instructions(memory, memory_actions),
+                    }
+                    if current_turn_tool_mode:
+                        # Silent tool-selection pass. The Realtime API supports
+                        # per-response output_modalities and tool_choice overrides.
+                        response_options["output_modalities"] = ["text"]
+                        response_options["tool_choice"] = "required"
+                    else:
+                        # Keep ordinary conversation fast and prevent surprise
+                        # toolcalls from creating spoken preambles.
+                        response_options["output_modalities"] = ["audio"]
+                        response_options["tool_choice"] = "none"
+
+                    await connection.response.create(response=response_options)
 
                 elif event.type == "response.function_call_arguments.done":
                     bridge.setState("thinking")
@@ -1220,10 +1269,34 @@ async def realtime_worker(bridge):
 
                     if tool_followup_pending:
                         tool_followup_pending = False
+                        current_turn_tool_mode = False
                         first_audio_seen = False
                         bridge.setState("thinking")
                         await connection.response.create(
-                            response={"instructions": build_tool_instructions(memory)}
+                            response={
+                                "instructions": build_tool_instructions(memory),
+                                "output_modalities": ["audio"],
+                                "tool_choice": "none",
+                            }
+                        )
+                    elif current_turn_tool_mode:
+                        # A required tool response should normally contain at least
+                        # one function call. If the server ever completes without one,
+                        # fail gracefully with a spoken explanation rather than silence.
+                        current_turn_tool_mode = False
+                        first_audio_seen = False
+                        bridge.setState("thinking")
+                        await connection.response.create(
+                            response={
+                                "instructions": (
+                                    build_tool_instructions(memory)
+                                    + "\n\nEr werd geen toolresultaat geproduceerd. "
+                                    "Leg kort uit dat de actuele actie of informatie "
+                                    "niet kon worden opgehaald."
+                                ),
+                                "output_modalities": ["audio"],
+                                "tool_choice": "none",
+                            }
                         )
 
                 elif event.type == "error":
