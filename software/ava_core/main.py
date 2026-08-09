@@ -33,7 +33,8 @@ Karakter:
 - Je bent een assistent met een eigen herkenbaar karakter, geen generieke chatbot.
 
 Spreekstijl:
-- Antwoord meestal kort: één tot vier zinnen.
+- Antwoord meestal kort: één tot drie zinnen.
+- Geef eerst het directe antwoord; voeg alleen uitleg toe als die nuttig is.
 - Gebruik gewone spreektaal en vermijd lange opsommingen.
 - Gebruik geen markdown, emoji of speciale opmaak in gesproken antwoorden.
 - Begin een antwoord niet met je eigen naam.
@@ -55,26 +56,24 @@ TTS_INSTRUCTIONS = (
     "niet als 'Eva'. Spreek technisch klinkende woorden helder uit."
 )
 
-TRANSCRIPTION_PROMPT = (
-    "Belgisch-Nederlands gesprek. De naam van de assistent is AVA."
-)
+TRANSCRIPTION_PROMPT = "Belgisch-Nederlands gesprek. De assistent heet AVA."
 
 
 class AVA:
     SAMPLE_RATE = 16000
     MIC_NAME = "C270"
     RECORDING_FILE = "/tmp/ava_input.wav"
-    SPEECH_FILE = "/tmp/ava_reply.mp3"
-    MAX_HISTORY_MESSAGES = 12
+    SPEECH_FILE = "/tmp/ava_reply.wav"
+    MAX_HISTORY_MESSAGES = 10
 
     BLOCK_DURATION = 0.1
-    SILENCE_TO_STOP = 0.9
+    SILENCE_TO_STOP = 0.65
     WAIT_FOR_SPEECH_TIMEOUT = 30.0
     MAX_UTTERANCE_DURATION = 20.0
-    PRE_ROLL_DURATION = 0.4
+    PRE_ROLL_DURATION = 0.35
     CALIBRATION_DURATION = 1.5
-    START_CONFIRMATION_BLOCKS = 3
-    MIN_RECORDING_DURATION = 0.45
+    START_CONFIRMATION_BLOCKS = 2
+    MIN_RECORDING_DURATION = 0.4
 
     def __init__(self):
         self.state = AVAState.IDLE
@@ -127,16 +126,8 @@ class AVA:
                 levels.append(self.audio_level(block))
 
         self.noise_floor = float(np.percentile(levels, 70))
-        self.start_threshold = max(
-            0.04,
-            self.noise_floor + 0.03,
-            self.noise_floor * 1.20,
-        )
-        self.end_threshold = max(
-            0.025,
-            self.noise_floor + 0.012,
-            self.noise_floor * 1.08,
-        )
+        self.start_threshold = max(0.04, self.noise_floor + 0.03, self.noise_floor * 1.20)
+        self.end_threshold = max(0.025, self.noise_floor + 0.012, self.noise_floor * 1.08)
 
         print(
             "Noise floor: "
@@ -236,18 +227,20 @@ class AVA:
         prompt_echo_markers = (
             "belgisch-nederlands gesprek",
             "de naam van de assistent is ava",
+            "de assistent heet ava",
             "dit is standaard nederlands uit belgie",
             "verwacht nederlandse zinnen en woorden",
         )
         return not any(marker in normalized for marker in prompt_echo_markers)
 
     def transcribe(self):
+        started = time.monotonic()
         self.set_state(AVAState.THINKING)
         print("Transcribing...")
 
         with open(self.RECORDING_FILE, "rb") as audio_file:
             transcript = self.client.audio.transcriptions.create(
-                model="gpt-4o-transcribe",
+                model="gpt-4o-mini-transcribe",
                 file=audio_file,
                 language="nl",
                 prompt=TRANSCRIPTION_PROMPT,
@@ -255,9 +248,11 @@ class AVA:
 
         text = transcript.text.strip()
         print(f"AVA heard: {text}")
+        print(f"Transcription latency: {time.monotonic() - started:.2f}s")
         return text
 
     def think(self, text):
+        started = time.monotonic()
         print("Thinking...")
 
         conversation = [
@@ -278,28 +273,33 @@ class AVA:
         self.history = self.history[-self.MAX_HISTORY_MESSAGES :]
 
         print(f"AVA: {reply}")
+        print(f"Thinking latency: {time.monotonic() - started:.2f}s")
         return reply
 
     def speak(self, text):
+        started = time.monotonic()
         self.set_state(AVAState.SPEAKING)
+        print("Generating speech...")
 
         with self.client.audio.speech.with_streaming_response.create(
             model="gpt-4o-mini-tts",
             voice="alloy",
             input=text,
             instructions=TTS_INSTRUCTIONS,
+            response_format="wav",
         ) as audio_response:
             audio_response.stream_to_file(self.SPEECH_FILE)
 
+        generated = time.monotonic()
+        print(f"TTS generation latency: {generated - started:.2f}s")
         print("Speaking...")
 
         subprocess.run(
             [
-                "ffplay",
-                "-nodisp",
-                "-autoexit",
-                "-loglevel",
-                "quiet",
+                "aplay",
+                "-q",
+                "-D",
+                "plughw:0,0",
                 self.SPEECH_FILE,
             ],
             check=True,
@@ -309,6 +309,7 @@ class AVA:
         if not self.record_audio():
             return
 
+        turn_started = time.monotonic()
         text = self.transcribe()
 
         if not self.transcript_is_valid(text):
@@ -317,11 +318,12 @@ class AVA:
 
         reply = self.think(text)
         self.speak(reply)
+        print(f"Total response turn: {time.monotonic() - turn_started:.2f}s")
 
     def start(self):
         print("Project AVA")
-        print("AVA Core v0.4.1 - Robust Listening")
-        print("----------------------------------")
+        print("AVA Core v0.5 - Faster Conversation")
+        print("------------------------------------")
         print("Press Ctrl+C to stop AVA.")
 
         self.set_state(AVAState.IDLE)
