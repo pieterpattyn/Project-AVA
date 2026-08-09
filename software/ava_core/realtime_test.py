@@ -18,7 +18,7 @@ OUTPUT_NAME = "Headphones"
 API_SAMPLE_RATE = 24000
 CHANNELS = 1
 CHUNK_MS = 20
-PLAYBACK_PREBUFFER_MS = 500
+PLAYBACK_PREBUFFER_MS = 650
 
 INSTRUCTIONS = """
 Je bent AVA, een persoonlijke slimme assistent.
@@ -105,63 +105,71 @@ class PCMPlayer:
         self.thread.join(timeout=2)
 
     def _run(self):
-        prebuffer_bytes = int(API_SAMPLE_RATE * 2 * PLAYBACK_PREBUFFER_MS / 1000)
-        api_buffer = bytearray()
-        response_done = False
+        buffer_lock = threading.Lock()
+        pcm_buffer = bytearray()
+        response_done = threading.Event()
+        playback_started = threading.Event()
+        prebuffer_bytes = int(self.output_rate * 2 * PLAYBACK_PREBUFFER_MS / 1000)
 
-        stream = sd.RawOutputStream(
+        def output_callback(outdata, frames, time_info, status):
+            if status and status.output_underflow:
+                print("Output callback underflow flag.")
+
+            needed = frames * 2
+            chunk = b""
+
+            with buffer_lock:
+                if playback_started.is_set():
+                    take = min(needed, len(pcm_buffer))
+                    if take:
+                        chunk = bytes(pcm_buffer[:take])
+                        del pcm_buffer[:take]
+
+                    if response_done.is_set() and not pcm_buffer:
+                        playback_started.clear()
+                        response_done.clear()
+                        self.playback_active.clear()
+
+            if len(chunk) < needed:
+                chunk += b"\x00" * (needed - len(chunk))
+
+            outdata[:] = chunk
+
+        with sd.RawOutputStream(
             samplerate=self.output_rate,
             device=self.output_device,
             channels=1,
             dtype="int16",
             blocksize=max(1, int(self.output_rate * 0.04)),
             latency="high",
-        )
-
-        try:
+            callback=output_callback,
+        ):
             while not self.stop_event.is_set():
                 item = self.queue.get()
                 if item is None:
                     break
 
                 if item is self.RESPONSE_DONE:
-                    response_done = True
-                else:
-                    api_buffer.extend(item)
+                    response_done.set()
+                    with buffer_lock:
+                        if not pcm_buffer:
+                            playback_started.clear()
+                            response_done.clear()
+                            self.playback_active.clear()
+                    continue
 
-                if not stream.active:
-                    if not response_done and len(api_buffer) < prebuffer_bytes:
-                        continue
-                    stream.start()
+                converted = resample_pcm16_mono(
+                    item,
+                    API_SAMPLE_RATE,
+                    self.output_rate,
+                )
 
-                while api_buffer:
-                    api_frames = int(API_SAMPLE_RATE * 0.04)
-                    api_bytes = api_frames * 2
+                with buffer_lock:
+                    pcm_buffer.extend(converted)
+                    if not playback_started.is_set() and len(pcm_buffer) >= prebuffer_bytes:
+                        playback_started.set()
 
-                    if len(api_buffer) < api_bytes and not response_done:
-                        break
-
-                    take = min(api_bytes, len(api_buffer))
-                    chunk = bytes(api_buffer[:take])
-                    del api_buffer[:take]
-                    output_chunk = resample_pcm16_mono(
-                        chunk,
-                        API_SAMPLE_RATE,
-                        self.output_rate,
-                    )
-                    underflowed = stream.write(output_chunk)
-                    if underflowed:
-                        print("Playback underflow detected.")
-
-                if response_done and not api_buffer:
-                    response_done = False
-                    if stream.active:
-                        stream.stop()
-                    self.playback_active.clear()
-        finally:
-            if stream.active:
-                stream.stop()
-            stream.close()
+        self.playback_active.clear()
 
 
 async def main():
