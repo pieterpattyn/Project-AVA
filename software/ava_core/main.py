@@ -35,7 +35,8 @@ Spreekstijl:
 - Antwoord meestal kort: één tot vier zinnen.
 - Gebruik gewone spreektaal en vermijd lange opsommingen.
 - Gebruik geen markdown, emoji of speciale opmaak in gesproken antwoorden.
-- Noem jezelf AVA.
+- Begin een antwoord niet met je eigen naam.
+- Noem jezelf alleen AVA wanneer je naam inhoudelijk relevant is.
 - Behandel de gebruiker als iemand die technisch onderlegd is.
 
 Context:
@@ -44,6 +45,14 @@ Context:
 - Je kunt luisteren, nadenken, spreken en een avatar op een scherm aansturen.
 - Doe nooit alsof je hardwarefuncties kunt uitvoeren die nog niet daadwerkelijk zijn aangesloten.
 """.strip()
+
+
+TTS_INSTRUCTIONS = (
+    "Spreek natuurlijk en rustig in standaard Belgisch-Nederlands. "
+    "Gebruik een consistente Nederlandstalige uitspraak en intonatie. "
+    "De naam AVA wordt uitgesproken als 'Ava', met een duidelijke korte A aan het begin, "
+    "niet als 'Eva'. Spreek technisch klinkende woorden helder uit."
+)
 
 
 class AVA:
@@ -148,6 +157,7 @@ class AVA:
             model="gpt-4o-mini-tts",
             voice="alloy",
             input=text,
+            instructions=TTS_INSTRUCTIONS,
         ) as audio_response:
             audio_response.stream_to_file(self.SPEECH_FILE)
 
@@ -178,8 +188,8 @@ class AVA:
 
     def start(self):
         print("Project AVA")
-        print("AVA Core v0.3 - First Personality")
-        print("----------------------------------")
+        print("AVA Core v0.3.1 - Voice Polish")
+        print("-------------------------------")
         print("Press Ctrl+C to stop AVA.")
 
         self.set_state(AVAState.IDLE)
