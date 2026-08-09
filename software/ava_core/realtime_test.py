@@ -19,10 +19,11 @@ API_SAMPLE_RATE = 24000
 CHANNELS = 1
 CHUNK_MS = 20
 PLAYBACK_PREBUFFER_MS = 650
+TRANSCRIPTION_PROMPT = "Belgisch-Nederlands gesprek. De assistent heet AVA."
 
 INSTRUCTIONS = """
 Je bent AVA, een persoonlijke slimme assistent.
-Spreek natuurlijk, kort en in standaard Belgisch-Nederlands.
+Spreek altijd in natuurlijk standaard Belgisch-Nederlands, tenzij de gebruiker expliciet een andere taal vraagt.
 Je bent intelligent, analytisch, direct en betrouwbaar, met subtiele droge humor.
 Begin antwoorden niet met je eigen naam.
 De naam AVA spreek je uit als 'Ava', niet als 'Eva'.
@@ -70,6 +71,19 @@ def resample_pcm16_mono(data, source_rate, target_rate):
     return converted.tobytes()
 
 
+def transcript_is_valid(text):
+    normalized = " ".join(text.lower().strip().split())
+    if len(normalized) < 2:
+        return False
+
+    ghost_markers = (
+        "belgisch-nederlands gesprek",
+        "de assistent heet ava",
+        "de naam van de assistent is ava",
+    )
+    return not any(marker in normalized for marker in ghost_markers)
+
+
 class PCMPlayer:
     RESPONSE_DONE = object()
 
@@ -112,9 +126,6 @@ class PCMPlayer:
         prebuffer_bytes = int(self.output_rate * 2 * PLAYBACK_PREBUFFER_MS / 1000)
 
         def output_callback(outdata, frames, time_info, status):
-            if status and status.output_underflow:
-                print("Output callback underflow flag.")
-
             needed = frames * 2
             chunk = b""
 
@@ -220,14 +231,14 @@ async def main():
                         "transcription": {
                             "model": "gpt-4o-transcribe",
                             "language": "nl",
-                            "prompt": "Belgisch-Nederlands gesprek. De assistent heet AVA.",
+                            "prompt": TRANSCRIPTION_PROMPT,
                         },
                         "turn_detection": {
                             "type": "server_vad",
                             "threshold": 0.5,
                             "prefix_padding_ms": 300,
                             "silence_duration_ms": 500,
-                            "create_response": True,
+                            "create_response": False,
                             "interrupt_response": False,
                         },
                     },
@@ -239,7 +250,7 @@ async def main():
             }
         )
 
-        print("Project AVA - Realtime stability test")
+        print("Project AVA - Realtime guarded-response test")
         print("Speak naturally. Ctrl+C stops the test.")
         print("Connected. Listening...")
 
@@ -275,7 +286,13 @@ async def main():
                     print("You: [finished]")
 
                 elif event.type == "conversation.item.input_audio_transcription.completed":
-                    print(f"You heard as: {event.transcript}")
+                    transcript = event.transcript.strip()
+                    print(f"You heard as: {transcript}")
+
+                    if transcript_is_valid(transcript):
+                        await connection.response.create()
+                    else:
+                        print("Ignored ghost/empty transcription. Listening...")
 
                 elif event.type == "response.output_audio.delta":
                     if not first_audio_seen:
