@@ -4,6 +4,7 @@ import json
 import os
 import queue
 import re
+import signal
 import sys
 import threading
 import time
@@ -14,7 +15,7 @@ import numpy as np
 import sounddevice as sd
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from PySide6.QtCore import QObject, Property, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, Property, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 
@@ -32,6 +33,7 @@ CALIBRATION_DURATION = 1.5
 MIN_VOICE_DURATION = 0.18
 MEMORY_FILE = Path.home() / ".local" / "share" / "project-ava" / "memory.json"
 MAX_MEMORY_FACTS = 40
+
 TRANSCRIPTION_PROMPT = (
     "Belgisch-Nederlands gesprek. De assistent heet AVA. "
     "Veel voorkomende zinnen zijn: Hey AVA, hoe is het met je, wat versta je nu?"
@@ -45,30 +47,44 @@ Begin antwoorden niet met je eigen naam.
 De naam AVA spreek je uit als 'Ava', niet als 'Eva'.
 Geef meestal antwoord in een tot drie korte zinnen.
 Baseer je antwoord op de meest recente tekstboodschap van de gebruiker.
-Als er persistente geheugencontext wordt meegegeven, behandel die als betrouwbare lokale context van Project AVA.
+Gebruik persistente geheugencontext als betrouwbare lokale context van Project AVA.
 Zeg nooit dat je iets permanent onthoudt tenzij de lokale geheugenlaag dat daadwerkelijk heeft opgeslagen.
+Herhaal je eigen vorige antwoord niet tenzij de gebruiker daar expliciet om vraagt.
 """.strip()
 
 
 class LocalMemory:
     def __init__(self, path):
         self.path = path
-        self.data = {"name": None, "facts": []}
+        self.data = {"name": None, "preferences": {}, "facts": []}
         self.load()
 
     def load(self):
         try:
-            if self.path.exists():
-                loaded = json.loads(self.path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    name = loaded.get("name")
-                    facts = loaded.get("facts", [])
-                    self.data["name"] = name if isinstance(name, str) and name.strip() else None
-                    self.data["facts"] = [
-                        str(fact).strip()
-                        for fact in facts
-                        if str(fact).strip()
-                    ][:MAX_MEMORY_FACTS]
+            if not self.path.exists():
+                return
+
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                return
+
+            name = loaded.get("name")
+            facts = loaded.get("facts", [])
+            preferences = loaded.get("preferences", {})
+
+            self.data["name"] = (
+                name.strip() if isinstance(name, str) and name.strip() else None
+            )
+            self.data["facts"] = [
+                str(fact).strip()
+                for fact in facts
+                if str(fact).strip()
+            ][:MAX_MEMORY_FACTS]
+            self.data["preferences"] = {
+                str(key).strip(): str(value).strip()
+                for key, value in preferences.items()
+                if str(key).strip() and str(value).strip()
+            } if isinstance(preferences, dict) else {}
         except (OSError, json.JSONDecodeError) as error:
             print(f"Memory load warning: {error}")
 
@@ -98,13 +114,35 @@ class LocalMemory:
         self.save()
         return True
 
+    def set_preference(self, topic, value):
+        topic_clean = topic.strip(" .,!?:;\"'").casefold()
+        value_clean = value.strip(" .,!?:;\"'")
+        if not topic_clean or not value_clean:
+            return False
+
+        changed = self.data["preferences"].get(topic_clean) != value_clean
+        self.data["preferences"][topic_clean] = value_clean
+        if changed:
+            self.save()
+        return changed
+
+    def forget_preference(self, topic):
+        topic_clean = topic.strip(" .,!?:;\"'").casefold()
+        if topic_clean not in self.data["preferences"]:
+            return False
+        del self.data["preferences"][topic_clean]
+        self.save()
+        return True
+
     def add_fact(self, fact):
         cleaned = fact.strip(" .")
         if not cleaned:
             return False
+
         existing = {item.casefold() for item in self.data["facts"]}
         if cleaned.casefold() in existing:
             return False
+
         self.data["facts"].append(cleaned)
         self.data["facts"] = self.data["facts"][-MAX_MEMORY_FACTS:]
         self.save()
@@ -117,7 +155,8 @@ class LocalMemory:
 
         old = self.data["facts"]
         new = [
-            fact for fact in old
+            fact
+            for fact in old
             if cleaned not in fact.casefold() and fact.casefold() not in cleaned
         ]
         changed = len(new) != len(old)
@@ -128,43 +167,38 @@ class LocalMemory:
 
     def context_text(self):
         lines = []
+
         if self.data.get("name"):
             lines.append(f"De gebruiker heet {self.data['name']}.")
+
+        for topic, value in self.data["preferences"].items():
+            lines.append(f"Voorkeur van de gebruiker: favoriete {topic} = {value}.")
+
         for fact in self.data["facts"]:
             lines.append(f"Onthouden feit: {fact}.")
+
         if not lines:
             return "Er zijn nog geen persistente herinneringen opgeslagen."
         return "\n".join(lines)
 
     def summary(self):
         name = self.data.get("name") or "onbekend"
-        return f"naam={name}, feiten={len(self.data['facts'])}"
+        return (
+            f"naam={name}, voorkeuren={len(self.data['preferences'])}, "
+            f"feiten={len(self.data['facts'])}"
+        )
 
 
 def process_memory_request(transcript, memory):
     text = transcript.strip()
     lower = text.casefold()
 
-    forget_name_phrases = (
-        "vergeet mijn naam",
-        "vergeet hoe ik heet",
-        "wis mijn naam",
-    )
-    if any(phrase in lower for phrase in forget_name_phrases):
+    if any(
+        phrase in lower
+        for phrase in ("vergeet mijn naam", "vergeet hoe ik heet", "wis mijn naam")
+    ):
         changed = memory.forget_name()
         return "naam verwijderd" if changed else "naam was niet opgeslagen"
-
-    remember_match = re.search(r"\bonthoud(?:t)?\s+dat\s+(.+)", text, re.IGNORECASE)
-    if remember_match:
-        fact = remember_match.group(1).strip()
-        changed = memory.add_fact(fact)
-        return f"feit opgeslagen: {fact}" if changed else f"feit stond al in geheugen: {fact}"
-
-    forget_match = re.search(r"\bvergeet\s+dat\s+(.+)", text, re.IGNORECASE)
-    if forget_match:
-        target = forget_match.group(1).strip()
-        changed = memory.forget_fact(target)
-        return f"feit verwijderd: {target}" if changed else f"geen passend feit gevonden: {target}"
 
     name_match = re.search(
         r"\b(?:mijn naam is|ik heet)\s+([A-Za-zÀ-ÖØ-öø-ÿ' -]{2,40}?)(?:[.!?,]|$)",
@@ -176,7 +210,86 @@ def process_memory_request(transcript, memory):
         changed = memory.set_name(name)
         return f"naam opgeslagen: {name}" if changed else f"naam bevestigd: {name}"
 
+    # Examples handled:
+    # "Mijn favoriete kleur is blauw"
+    # "Onthoud dat mijn favoriete kleur rood is"
+    # "Mijn favoriete kleur is nu groen"
+    preference_match = re.search(
+        r"\b(?:onthoud(?:t)?\s+dat\s+)?mijn\s+favoriete\s+"
+        r"([\wÀ-ÖØ-öø-ÿ' -]{2,40}?)\s+(?:is\s+nu|is|wordt)\s+(.+?)(?:[.!?]|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if preference_match:
+        topic = preference_match.group(1).strip()
+        value = preference_match.group(2).strip()
+        changed = memory.set_preference(topic, value)
+        return (
+            f"favoriete {topic} aangepast naar {value}"
+            if changed
+            else f"favoriete {topic} stond al op {value}"
+        )
+
+    change_preference_match = re.search(
+        r"\b(?:verander|wijzig|pas)\s+(?:mijn\s+)?favoriete\s+"
+        r"([\wÀ-ÖØ-öø-ÿ' -]{2,40}?)\s+(?:aan\s+)?(?:naar|in)\s+(.+?)(?:[.!?]|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if change_preference_match:
+        topic = change_preference_match.group(1).strip()
+        value = change_preference_match.group(2).strip()
+        changed = memory.set_preference(topic, value)
+        return (
+            f"favoriete {topic} aangepast naar {value}"
+            if changed
+            else f"favoriete {topic} stond al op {value}"
+        )
+
+    forget_preference_match = re.search(
+        r"\bvergeet\s+(?:wat\s+)?mijn\s+favoriete\s+"
+        r"([\wÀ-ÖØ-öø-ÿ' -]{2,40}?)(?:\s+is)?(?:[.!?]|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if forget_preference_match:
+        topic = forget_preference_match.group(1).strip()
+        changed = memory.forget_preference(topic)
+        return (
+            f"favoriete {topic} verwijderd"
+            if changed
+            else f"favoriete {topic} was niet opgeslagen"
+        )
+
+    remember_match = re.search(r"\bonthoud(?:t)?\s+dat\s+(.+)", text, re.IGNORECASE)
+    if remember_match:
+        fact = remember_match.group(1).strip()
+        changed = memory.add_fact(fact)
+        return (
+            f"feit opgeslagen: {fact}"
+            if changed
+            else f"feit stond al in geheugen: {fact}"
+        )
+
+    forget_match = re.search(r"\bvergeet\s+dat\s+(.+)", text, re.IGNORECASE)
+    if forget_match:
+        target = forget_match.group(1).strip()
+        changed = memory.forget_fact(target)
+        return (
+            f"feit verwijderd: {target}"
+            if changed
+            else f"geen passend feit gevonden: {target}"
+        )
+
     return None
+
+
+def build_instructions(memory):
+    return (
+        BASE_INSTRUCTIONS
+        + "\n\nPersistente geheugencontext:\n"
+        + memory.context_text()
+    )
 
 
 class AvatarBridge(QObject):
@@ -447,7 +560,7 @@ async def realtime_worker(bridge):
             session={
                 "type": "realtime",
                 "model": MODEL,
-                "instructions": BASE_INSTRUCTIONS,
+                "instructions": build_instructions(memory),
                 "output_modalities": ["audio"],
                 "audio": {
                     "input": {
@@ -473,7 +586,7 @@ async def realtime_worker(bridge):
             }
         )
 
-        print("Project AVA v0.7 - Realtime + Persistent Memory")
+        print("Project AVA v0.7.1 - Stable Memory")
         print("Connected. Speak naturally. Ctrl+C stops the process.")
         bridge.setState("listening")
 
@@ -523,8 +636,7 @@ async def realtime_worker(bridge):
                     bridge.setState("thinking")
                     print("You: [finished]")
                     print(
-                        f"Local voice evidence: {voice_duration:.2f}s | "
-                        f"peak: {peak:.3f}"
+                        f"Local voice evidence: {voice_duration:.2f}s | peak: {peak:.3f}"
                     )
 
                 elif event.type == "conversation.item.input_audio_transcription.completed":
@@ -540,6 +652,14 @@ async def realtime_worker(bridge):
                         voice_duration >= MIN_VOICE_DURATION
                         and peak >= peak_threshold
                     )
+
+                    # Remove the automatically committed raw-audio user item.
+                    # We replace it with one authoritative text item below. Keeping
+                    # both was the source of repeated / doubled responses in v0.7.
+                    try:
+                        await connection.conversation.item.delete(item_id=event.item_id)
+                    except Exception as error:
+                        print(f"Conversation cleanup warning: {error}")
 
                     if not local_voice_ok:
                         print(
@@ -557,27 +677,15 @@ async def realtime_worker(bridge):
                     memory_result = process_memory_request(transcript, memory)
                     if memory_result:
                         print(f"Memory: {memory_result}")
-
-                    memory_context = memory.context_text()
-                    authoritative_text = (
-                        "[Persistente geheugencontext van Project AVA]\n"
-                        f"{memory_context}\n"
-                    )
-                    if memory_result:
-                        authoritative_text += (
-                            "[Lokale geheugenactie is al uitgevoerd]\n"
-                            f"{memory_result}\n"
+                        await connection.session.update(
+                            session={"instructions": build_instructions(memory)}
                         )
-                    authoritative_text += (
-                        "[Meest recente boodschap van de gebruiker]\n"
-                        f"{transcript}"
-                    )
 
                     await connection.conversation.item.create(
                         item={
                             "type": "message",
                             "role": "user",
-                            "content": [{"type": "input_text", "text": authoritative_text}],
+                            "content": [{"type": "input_text", "text": transcript}],
                         }
                     )
                     await connection.response.create()
@@ -588,7 +696,10 @@ async def realtime_worker(bridge):
                         bridge.setState("speaking")
                         if last_speech_stopped is not None:
                             latency = time.monotonic() - last_speech_stopped
-                            print(f"AVA first audio latency: {latency:.2f}s")
+                            print(
+                                f"AVA first audio latency: "
+                                f"{time.monotonic() - last_speech_stopped:.2f}s"
+                            )
                         print("AVA: [speaking]")
                     player.add(base64.b64decode(event.delta))
 
@@ -639,6 +750,14 @@ def main():
 
     if not engine.rootObjects():
         raise RuntimeError("Could not load AVA avatar UI.")
+
+    # Qt can otherwise spend most of its time inside the C++ event loop and Python
+    # does not get a chance to process SIGINT from the SSH terminal. The timer gives
+    # Python regular control, while the signal handler quits the GUI cleanly.
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
+    signal_timer = QTimer()
+    signal_timer.timeout.connect(lambda: None)
+    signal_timer.start(200)
 
     worker = threading.Thread(
         target=run_realtime_thread,
