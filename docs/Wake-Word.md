@@ -4,7 +4,7 @@
 
 AVA v1.1 adds a local wake-word gate using the phrase **Hey AVA**.
 
-The proven v1.0 runtime remains untouched during phase A. Wake-word detection is first validated as an independent local path before it is allowed to gate the Realtime conversation loop.
+The proven v1.0 runtime remains untouched while the wake-word path is integrated in stages. This keeps the release baseline available if experimental gating code misbehaves, because microphones and asynchronous state machines apparently enjoy drama.
 
 ## Architecture
 
@@ -12,7 +12,7 @@ The proven v1.0 runtime remains untouched during phase A. Wake-word detection is
 C270 microphone
       |
       v
-Project AVA wakeword_probe.py
+Project AVA wake-word client
       |
       | 16 kHz / 16-bit mono PCM over Wyoming TCP
       v
@@ -34,27 +34,23 @@ tcp://127.0.0.1:10400
 
 The Wyoming protocol is a small streaming protocol used by Home Assistant voice services. The openWakeWord Wyoming server accepts 16 kHz, 16-bit mono PCM and emits a detection event when a configured wake-word model fires.
 
-A separate service is useful on AVA's Debian 13 / Python 3.13 Raspberry Pi because the direct openWakeWord Python dependency stack has had ARM64/Python-version compatibility problems, while current Wyoming openWakeWord packages the inference engine separately.
+A separate service is useful on AVA's Debian 13 / Python 3.13 Raspberry Pi because the direct openWakeWord Python dependency stack has had ARM64/Python-version compatibility problems, while Wyoming openWakeWord packages the inference engine separately.
 
 ## Custom Hey AVA model
 
-There is no trustworthy `Hey AVA` model in the community collection that Project AVA can simply adopt as its baseline, so v1.1 expects a model trained specifically for the phrase.
-
-Home Assistant's current official wake-word guide uses the openWakeWord training environment and Piper-generated speech. It recommends a short 3-4 syllable phrase and produces both `.tflite` and `.onnx` files. Project AVA uses the `.tflite` model.
-
-Train the phrase as:
+Project AVA uses a custom model trained for:
 
 ```text
 hey ava
 ```
 
-Listen carefully to the generated pronunciation before training. The synthetic pronunciation should match how the phrase will actually be spoken.
-
-Place the resulting model at:
+The trained TensorFlow Lite model lives at:
 
 ```text
 models/wakeword/hey_ava.tflite
 ```
+
+The model was validated on the target AVA Raspberry Pi with repeated successful standalone detections before Realtime integration began.
 
 ## Start the local wake-word server
 
@@ -67,12 +63,19 @@ docker compose -f docker-compose.wakeword.yml up -d
 Inspect it with:
 
 ```bash
-docker compose -f docker-compose.wakeword.yml logs -f
+docker compose -f docker-compose.wakeword.yml ps
+docker logs ava-wakeword --tail 100
 ```
 
-## Standalone detection test
+Expected port mapping:
 
-With the normal Project AVA virtual environment active:
+```text
+127.0.0.1:10400->10400/tcp
+```
+
+## Phase A - standalone detection
+
+Run:
 
 ```bash
 python software/ava_core/wakeword_probe.py
@@ -88,23 +91,71 @@ Luisteren... zeg 'Hey AVA'. Ctrl+C stopt.
 DETECTED: hey_ava
 ```
 
-This probe exits after one detection. That is deliberate: phase A proves the microphone -> resampler -> Wyoming -> custom model path without touching OpenAI Realtime or the v1.0 audio loop.
+This probe exits after one detection. Phase A proves the microphone -> resampler -> Wyoming -> custom model path without touching OpenAI Realtime or the v1.0 audio loop.
 
-## Phase B
+## Phase B - wake-to-Realtime handoff
 
-Only after standalone detection is reliable will v1.1 connect the wake gate to the assistant runtime.
-
-Planned state flow:
+Phase B adds:
 
 ```text
-idle -> Hey AVA detected -> listening -> thinking -> speaking -> idle
+software/ava_core/realtime_v11.py
 ```
 
-The final gate will keep microphone audio local while AVA is idle. Realtime user audio is opened only after wake detection. A short pre-roll ring buffer will preserve the beginning of commands spoken immediately after `Hey AVA`.
+It deliberately does not modify `realtime_v1.py`.
+
+Current phase-B flow:
+
+```text
+idle
+  -> local Hey AVA detection
+  -> release wake-word microphone stream
+  -> start proven v1.0 Realtime runtime
+  -> normal v1.0 conversation until Ctrl+C
+```
+
+Run it with:
+
+```bash
+python software/ava_core/realtime_v11.py
+```
+
+Expected startup flow:
+
+```text
+Project AVA v1.1-dev
+State: idle - lokaal wachten op 'Hey AVA'.
+Wake-word server: 127.0.0.1:10400
+Luisteren... zeg 'Hey AVA'. Ctrl+C stopt.
+DETECTED: hey_ava
+Wake accepted: hey_ava
+Starting proven AVA v1.0 Realtime runtime...
+Project AVA v1.0
+...
+```
+
+Phase B is intentionally a handoff smoke test. Once awakened, AVA remains in the existing v1.0 continuous conversation mode.
+
+## Phase C - final wake gate
+
+The next integration step is the real state machine:
+
+```text
+idle -> Hey AVA -> listening -> thinking -> speaking -> idle
+```
+
+Phase C will:
+
+- keep idle microphone audio local only;
+- open Realtime user audio only after wake detection;
+- return to wake-word idle after a completed interaction or timeout;
+- keep the avatar visible while idle;
+- add a short pre-roll buffer so commands spoken immediately after `Hey AVA` do not lose their first syllable.
+
+This stage is deferred until the phase-B handoff is proven on the actual Pi.
 
 ## Configuration
 
-The probe supports these environment variables:
+Wake-word code supports these environment variables:
 
 ```env
 AVA_WAKEWORD_URI=tcp://127.0.0.1:10400
