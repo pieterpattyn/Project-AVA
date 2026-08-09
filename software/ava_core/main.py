@@ -1,4 +1,5 @@
 import subprocess
+import time
 import wave
 from enum import Enum
 
@@ -57,11 +58,18 @@ TTS_INSTRUCTIONS = (
 
 class AVA:
     SAMPLE_RATE = 16000
-    RECORDING_DURATION = 5
     MIC_NAME = "C270"
     RECORDING_FILE = "/tmp/ava_input.wav"
     SPEECH_FILE = "/tmp/ava_reply.mp3"
     MAX_HISTORY_MESSAGES = 12
+
+    BLOCK_DURATION = 0.1
+    START_THRESHOLD = 0.035
+    END_THRESHOLD = 0.025
+    SILENCE_TO_STOP = 0.9
+    WAIT_FOR_SPEECH_TIMEOUT = 30.0
+    MAX_UTTERANCE_DURATION = 20.0
+    PRE_ROLL_DURATION = 0.4
 
     def __init__(self):
         self.state = AVAState.IDLE
@@ -84,18 +92,71 @@ class AVA:
 
         raise RuntimeError(f"Microphone containing '{name}' not found.")
 
+    @staticmethod
+    def audio_level(block):
+        samples = block.astype(np.float32) / 32768.0
+        return float(np.sqrt(np.mean(samples * samples)))
+
     def record_audio(self):
         self.set_state(AVAState.LISTENING)
-        print(f"Listening for {self.RECORDING_DURATION} seconds...")
+        print("Waiting for speech...")
 
-        audio = sd.rec(
-            int(self.RECORDING_DURATION * self.SAMPLE_RATE),
+        block_size = int(self.SAMPLE_RATE * self.BLOCK_DURATION)
+        pre_roll_blocks = max(1, int(self.PRE_ROLL_DURATION / self.BLOCK_DURATION))
+        pre_roll = []
+        recorded = []
+        speech_started = False
+        silence_duration = 0.0
+        wait_started = time.monotonic()
+        speech_started_at = None
+        peak = 0.0
+
+        with sd.InputStream(
             samplerate=self.SAMPLE_RATE,
             channels=1,
             dtype="int16",
             device=self.microphone,
-        )
-        sd.wait()
+            blocksize=block_size,
+        ) as stream:
+            while True:
+                block, overflowed = stream.read(block_size)
+                if overflowed:
+                    print("Audio input overflow detected.")
+
+                block = block.copy()
+                level = self.audio_level(block)
+                peak = max(peak, level)
+
+                if not speech_started:
+                    pre_roll.append(block)
+                    if len(pre_roll) > pre_roll_blocks:
+                        pre_roll.pop(0)
+
+                    if level >= self.START_THRESHOLD:
+                        speech_started = True
+                        speech_started_at = time.monotonic()
+                        recorded.extend(pre_roll)
+                        pre_roll.clear()
+                        print("Speech detected.")
+                    elif time.monotonic() - wait_started >= self.WAIT_FOR_SPEECH_TIMEOUT:
+                        print("No speech detected within timeout.")
+                        return False
+                else:
+                    recorded.append(block)
+
+                    if level < self.END_THRESHOLD:
+                        silence_duration += self.BLOCK_DURATION
+                    else:
+                        silence_duration = 0.0
+
+                    utterance_duration = time.monotonic() - speech_started_at
+                    if silence_duration >= self.SILENCE_TO_STOP:
+                        break
+                    if utterance_duration >= self.MAX_UTTERANCE_DURATION:
+                        print("Maximum speech duration reached.")
+                        break
+
+        audio = np.concatenate(recorded, axis=0)
 
         with wave.open(self.RECORDING_FILE, "wb") as wav:
             wav.setnchannels(1)
@@ -103,8 +164,9 @@ class AVA:
             wav.setframerate(self.SAMPLE_RATE)
             wav.writeframes(audio.tobytes())
 
-        peak = float(np.max(np.abs(audio.astype(np.float32))) / 32768.0)
-        print(f"Microphone peak: {peak:.3f}")
+        print(f"Microphone RMS peak: {peak:.3f}")
+        print(f"Recorded: {len(audio) / self.SAMPLE_RATE:.1f} seconds")
+        return True
 
     def transcribe(self):
         self.set_state(AVAState.THINKING)
@@ -176,7 +238,9 @@ class AVA:
         )
 
     def conversation_once(self):
-        self.record_audio()
+        if not self.record_audio():
+            return
+
         text = self.transcribe()
 
         if not text.strip():
@@ -188,8 +252,8 @@ class AVA:
 
     def start(self):
         print("Project AVA")
-        print("AVA Core v0.3.1 - Voice Polish")
-        print("-------------------------------")
+        print("AVA Core v0.4 - Natural Conversation")
+        print("-------------------------------------")
         print("Press Ctrl+C to stop AVA.")
 
         self.set_state(AVAState.IDLE)
