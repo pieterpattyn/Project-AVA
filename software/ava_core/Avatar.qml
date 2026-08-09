@@ -8,14 +8,13 @@ Window {
     color: "#080b10"
     title: "Project AVA"
 
-    property string avaState: "idle"
+    property string avaState: avatarBridge.state
 
     Rectangle {
         anchors.fill: parent
         color: root.color
 
         Text {
-            id: title
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.top: parent.top
             anchors.topMargin: 35
@@ -32,7 +31,6 @@ Window {
             anchors.centerIn: parent
 
             Rectangle {
-                id: leftEye
                 width: 105
                 height: root.avaState === "thinking" ? 16 : 42
                 radius: height / 2
@@ -47,7 +45,6 @@ Window {
             }
 
             Rectangle {
-                id: rightEye
                 width: 105
                 height: root.avaState === "thinking" ? 16 : 42
                 radius: height / 2
@@ -64,17 +61,27 @@ Window {
             Rectangle {
                 id: mouth
                 width: root.avaState === "speaking" ? 95 : 55
-                height: root.avaState === "speaking" ? 22 : 8
+                height: 8
                 radius: height / 2
                 anchors.horizontalCenter: parent.horizontalCenter
                 anchors.bottom: parent.bottom
                 color: "#8defff"
 
-                SequentialAnimation on height {
+                SequentialAnimation {
                     running: root.avaState === "speaking"
                     loops: Animation.Infinite
-                    NumberAnimation { to: 28; duration: 120 }
-                    NumberAnimation { to: 8; duration: 140 }
+                    NumberAnimation {
+                        target: mouth
+                        property: "height"
+                        to: 28
+                        duration: 120
+                    }
+                    NumberAnimation {
+                        target: mouth
+                        property: "height"
+                        to: 8
+                        duration: 140
+                    }
                 }
             }
         }
