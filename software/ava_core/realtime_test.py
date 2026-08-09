@@ -18,7 +18,7 @@ OUTPUT_NAME = "Headphones"
 API_SAMPLE_RATE = 24000
 CHANNELS = 1
 CHUNK_MS = 20
-PLAYBACK_PREBUFFER_MS = 300
+PLAYBACK_PREBUFFER_MS = 500
 
 INSTRUCTIONS = """
 Je bent AVA, een persoonlijke slimme assistent.
@@ -109,14 +109,16 @@ class PCMPlayer:
         api_buffer = bytearray()
         response_done = False
 
-        with sd.RawOutputStream(
+        stream = sd.RawOutputStream(
             samplerate=self.output_rate,
             device=self.output_device,
             channels=1,
             dtype="int16",
-            blocksize=0,
+            blocksize=max(1, int(self.output_rate * 0.04)),
             latency="high",
-        ) as stream:
+        )
+
+        try:
             while not self.stop_event.is_set():
                 item = self.queue.get()
                 if item is None:
@@ -127,12 +129,12 @@ class PCMPlayer:
                 else:
                     api_buffer.extend(item)
 
-                if not response_done and len(api_buffer) < prebuffer_bytes:
-                    continue
+                if not stream.active:
+                    if not response_done and len(api_buffer) < prebuffer_bytes:
+                        continue
+                    stream.start()
 
                 while api_buffer:
-                    # Feed roughly 40 ms at a time. A larger block and the initial
-                    # jitter buffer keep the hardware supplied during network jitter.
                     api_frames = int(API_SAMPLE_RATE * 0.04)
                     api_bytes = api_frames * 2
 
@@ -153,7 +155,13 @@ class PCMPlayer:
 
                 if response_done and not api_buffer:
                     response_done = False
+                    if stream.active:
+                        stream.stop()
                     self.playback_active.clear()
+        finally:
+            if stream.active:
+                stream.stop()
+            stream.close()
 
 
 async def main():
@@ -179,8 +187,6 @@ async def main():
         if status:
             print(f"Audio status: {status}")
 
-        # For this stability test we do not stream the speaker output back into
-        # the model. Proper echo cancellation / barge-in comes later.
         if player.playback_active.is_set():
             return
 
@@ -202,6 +208,12 @@ async def main():
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcm", "rate": API_SAMPLE_RATE},
+                        "noise_reduction": {"type": "far_field"},
+                        "transcription": {
+                            "model": "gpt-4o-transcribe",
+                            "language": "nl",
+                            "prompt": "Belgisch-Nederlands gesprek. De assistent heet AVA.",
+                        },
                         "turn_detection": {
                             "type": "server_vad",
                             "threshold": 0.5,
@@ -253,6 +265,9 @@ async def main():
                 elif event.type == "input_audio_buffer.speech_stopped":
                     last_speech_stopped = time.monotonic()
                     print("You: [finished]")
+
+                elif event.type == "conversation.item.input_audio_transcription.completed":
+                    print(f"You heard as: {event.transcript}")
 
                 elif event.type == "response.output_audio.delta":
                     if not first_audio_seen:
