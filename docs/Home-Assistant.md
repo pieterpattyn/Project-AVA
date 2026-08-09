@@ -1,6 +1,6 @@
 # Project AVA - Home Assistant setup
 
-AVA v1.0-rc1 keeps Home Assistant as the source of truth for smart-home state and control.
+AVA v1.0 keeps Home Assistant as the source of truth for smart-home state and control.
 
 ## 1. Create a Home Assistant token
 
@@ -19,7 +19,7 @@ Use the actual Home Assistant URL if `homeassistant.local` is not reachable from
 
 Do not commit `.env` or the token to Git. Project AVA ignores `.env`.
 
-## 3. Run the consolidated release candidate
+## 3. Run AVA v1.0
 
 ```bash
 git pull
@@ -29,7 +29,7 @@ python software/ava_core/realtime_v1.py
 At startup AVA performs a small Home Assistant API preflight. A healthy setup prints something similar to:
 
 ```text
-Project AVA v1.0-rc1
+Project AVA v1.0
 Home Assistant: verbonden met http://homeassistant.local:8123
 Tools: tijd/datum + weer + Home Assistant
 Connected. Speak naturally. Ctrl+C stops the process.
@@ -68,7 +68,13 @@ Examples:
 - "Zet de keukenlamp op 30 procent."
 - "Doe de koffiemachine uit." (only when it is exposed as a Home Assistant `switch`)
 
-Locks, alarm systems, covers and other domains are not controlled in v1.0-rc1.
+Locks, alarm systems, covers and other domains are not controlled in v1.0.
+
+## Silent tool routing
+
+Likely Home Assistant commands are routed into a text-only Realtime tool-selection response with tool use required. Because that first response cannot emit audio, AVA cannot speak a filler sentence before the function call.
+
+After the Home Assistant result is available, AVA creates one compact audio follow-up with additional tool use disabled. Ordinary non-tool conversation stays on the direct audio path.
 
 ## Verified feedback
 
