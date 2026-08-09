@@ -55,6 +55,10 @@ TTS_INSTRUCTIONS = (
     "niet als 'Eva'. Spreek technisch klinkende woorden helder uit."
 )
 
+TRANSCRIPTION_PROMPT = (
+    "Belgisch-Nederlands gesprek. De naam van de assistent is AVA."
+)
+
 
 class AVA:
     SAMPLE_RATE = 16000
@@ -64,18 +68,23 @@ class AVA:
     MAX_HISTORY_MESSAGES = 12
 
     BLOCK_DURATION = 0.1
-    START_THRESHOLD = 0.035
-    END_THRESHOLD = 0.025
     SILENCE_TO_STOP = 0.9
     WAIT_FOR_SPEECH_TIMEOUT = 30.0
     MAX_UTTERANCE_DURATION = 20.0
     PRE_ROLL_DURATION = 0.4
+    CALIBRATION_DURATION = 1.5
+    START_CONFIRMATION_BLOCKS = 3
+    MIN_RECORDING_DURATION = 0.45
 
     def __init__(self):
         self.state = AVAState.IDLE
         self.client = OpenAI()
         self.microphone = self.find_microphone(self.MIC_NAME)
         self.history = []
+        self.noise_floor = 0.0
+        self.start_threshold = 0.04
+        self.end_threshold = 0.025
+        self.calibrate_noise_floor()
 
     def set_state(self, state):
         self.state = state
@@ -97,6 +106,45 @@ class AVA:
         samples = block.astype(np.float32) / 32768.0
         return float(np.sqrt(np.mean(samples * samples)))
 
+    def calibrate_noise_floor(self):
+        print("Calibrating microphone noise floor. Keep quiet for a moment...")
+
+        block_size = int(self.SAMPLE_RATE * self.BLOCK_DURATION)
+        block_count = max(1, int(self.CALIBRATION_DURATION / self.BLOCK_DURATION))
+        levels = []
+
+        with sd.InputStream(
+            samplerate=self.SAMPLE_RATE,
+            channels=1,
+            dtype="int16",
+            device=self.microphone,
+            blocksize=block_size,
+        ) as stream:
+            for _ in range(block_count):
+                block, overflowed = stream.read(block_size)
+                if overflowed:
+                    print("Audio input overflow during calibration.")
+                levels.append(self.audio_level(block))
+
+        self.noise_floor = float(np.percentile(levels, 70))
+        self.start_threshold = max(
+            0.04,
+            self.noise_floor + 0.03,
+            self.noise_floor * 1.20,
+        )
+        self.end_threshold = max(
+            0.025,
+            self.noise_floor + 0.012,
+            self.noise_floor * 1.08,
+        )
+
+        print(
+            "Noise floor: "
+            f"{self.noise_floor:.3f} | "
+            f"start: {self.start_threshold:.3f} | "
+            f"end: {self.end_threshold:.3f}"
+        )
+
     def record_audio(self):
         self.set_state(AVAState.LISTENING)
         print("Waiting for speech...")
@@ -106,6 +154,7 @@ class AVA:
         pre_roll = []
         recorded = []
         speech_started = False
+        speech_confirmation = 0
         silence_duration = 0.0
         wait_started = time.monotonic()
         speech_started_at = None
@@ -132,7 +181,12 @@ class AVA:
                     if len(pre_roll) > pre_roll_blocks:
                         pre_roll.pop(0)
 
-                    if level >= self.START_THRESHOLD:
+                    if level >= self.start_threshold:
+                        speech_confirmation += 1
+                    else:
+                        speech_confirmation = 0
+
+                    if speech_confirmation >= self.START_CONFIRMATION_BLOCKS:
                         speech_started = True
                         speech_started_at = time.monotonic()
                         recorded.extend(pre_roll)
@@ -144,7 +198,7 @@ class AVA:
                 else:
                     recorded.append(block)
 
-                    if level < self.END_THRESHOLD:
+                    if level < self.end_threshold:
                         silence_duration += self.BLOCK_DURATION
                     else:
                         silence_duration = 0.0
@@ -157,6 +211,11 @@ class AVA:
                         break
 
         audio = np.concatenate(recorded, axis=0)
+        duration = len(audio) / self.SAMPLE_RATE
+
+        if duration < self.MIN_RECORDING_DURATION:
+            print(f"Ignoring very short audio event ({duration:.2f}s).")
+            return False
 
         with wave.open(self.RECORDING_FILE, "wb") as wav:
             wav.setnchannels(1)
@@ -165,8 +224,22 @@ class AVA:
             wav.writeframes(audio.tobytes())
 
         print(f"Microphone RMS peak: {peak:.3f}")
-        print(f"Recorded: {len(audio) / self.SAMPLE_RATE:.1f} seconds")
+        print(f"Recorded: {duration:.1f} seconds")
         return True
+
+    @staticmethod
+    def transcript_is_valid(text):
+        normalized = " ".join(text.lower().strip().split())
+        if len(normalized) < 2:
+            return False
+
+        prompt_echo_markers = (
+            "belgisch-nederlands gesprek",
+            "de naam van de assistent is ava",
+            "dit is standaard nederlands uit belgie",
+            "verwacht nederlandse zinnen en woorden",
+        )
+        return not any(marker in normalized for marker in prompt_echo_markers)
 
     def transcribe(self):
         self.set_state(AVAState.THINKING)
@@ -177,17 +250,12 @@ class AVA:
                 model="gpt-4o-transcribe",
                 file=audio_file,
                 language="nl",
-                prompt=(
-                    "Dit is standaard Nederlands uit België. "
-                    "De assistent heet AVA. "
-                    "Verwacht Nederlandse zinnen en woorden zoals: "
-                    "AVA, stel jezelf voor, wie ben je, wat kun je, "
-                    "zet het licht aan, hoe is het weer."
-                ),
+                prompt=TRANSCRIPTION_PROMPT,
             )
 
-        print(f"AVA heard: {transcript.text}")
-        return transcript.text
+        text = transcript.text.strip()
+        print(f"AVA heard: {text}")
+        return text
 
     def think(self, text):
         print("Thinking...")
@@ -243,8 +311,8 @@ class AVA:
 
         text = self.transcribe()
 
-        if not text.strip():
-            print("No speech detected.")
+        if not self.transcript_is_valid(text):
+            print("Ignoring empty or suspicious transcription.")
             return
 
         reply = self.think(text)
@@ -252,8 +320,8 @@ class AVA:
 
     def start(self):
         print("Project AVA")
-        print("AVA Core v0.4 - Natural Conversation")
-        print("-------------------------------------")
+        print("AVA Core v0.4.1 - Robust Listening")
+        print("----------------------------------")
         print("Press Ctrl+C to stop AVA.")
 
         self.set_state(AVAState.IDLE)
