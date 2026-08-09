@@ -4,146 +4,115 @@
 
 AVA is a modular AI home assistant running on a Raspberry Pi-based console.
 
-The system must support:
+The current release candidate combines:
 
-- Voice interaction
-- Visual feedback through an avatar
-- Home Assistant integration
-- Camera input
-- Cloud and local AI providers
-- Future mobile hardware, such as a Roomba-based platform
+- Realtime voice interaction
+- Visual avatar state
+- Persistent local user memory
+- Current date/time and weather tools
+- Home Assistant state and control tools
 
-## Core Principles
+Future modules include vision, wake word, barge-in and mobile hardware.
 
-1. Modular components
-2. Home Assistant remains the source of truth for home automation
-3. AI providers must be replaceable
-4. The display and avatar must be independent from the AI engine
-5. Local processing is preferred where practical
-6. Cloud services may be used where they offer clear benefits
+## Core principles
 
-## Functional Modules
+1. Home Assistant remains the source of truth for home automation.
+2. Audio, display, memory and tools remain separable components.
+3. AI-provider-specific code should stay behind a narrow runtime boundary.
+4. Local processing is preferred where practical.
+5. Cloud services are used where they provide a clear capability or latency advantage.
+6. Safety-sensitive write tools require explicit scope and verification.
+7. Known-good checkpoints are preserved while experimental branches evolve.
+
+## Current v1.0-rc1 runtime
+
+Primary entry point:
+
+```text
+software/ava_core/realtime_v1.py
+```
+
+`realtime_v1.py` directly imports reusable hardware/audio/avatar primitives from `realtime_app.py`, but it no longer depends on the historical `realtime_tools_v08x` or `realtime_tools_v09x` monkey-patch chain.
 
 ### Listen
 
-Responsible for:
+- Logitech C270 USB microphone
+- Native 48 kHz capture
+- Resampling to 24 kHz API PCM
+- Server semantic VAD
+- Local RMS/peak speech guard
+- Ghost-transcript rejection
+- Raw server audio item replaced by the validated transcript as authoritative user input
 
-- Microphone input
-- Wake word detection
-- Voice activity detection
-- Audio preprocessing
-
-Possible implementations:
-
-- openWakeWord
-- Whisper
-- Cloud speech-to-text
-- Home Assistant Assist pipeline
+During AVA playback the microphone path is currently suppressed. This keeps the baseline stable but means barge-in is not yet supported.
 
 ### Think
 
-Responsible for:
-
-- Language model interaction
-- Intent interpretation
-- Conversation context
-- Tool and service selection
-
-Possible implementations:
-
-- OpenAI
-- Gemini
-- Local models through Ollama
-- py-xiaozhi backend
-- OpenVoiceOS
+- OpenAI Realtime session
+- Persistent conversation context
+- Local persistent memory context
+- Function/tool selection
+- Serialized tool follow-up responses so only one Realtime response is active at a time
 
 ### Speak
 
-Responsible for:
-
-- Text-to-speech
-- Audio playback
-- Voice selection
-- Lip-sync data for the avatar
-
-Possible implementations:
-
-- Piper
-- OpenAI TTS
-- Gemini TTS
-- Other cloud voice services
+- Realtime PCM audio output
+- Callback-driven `sounddevice` playback
+- Raspberry Pi headphone output
+- Prebuffered playback for stable audio
+- Avatar state transitions for listening/thinking/speaking
 
 ### Display
 
-Responsible for:
-
-- Avatar
-- Listening state
-- Thinking state
-- Speaking state
-- Home Assistant dashboard
-- Camera and notification views
-
-### See
-
-Responsible for:
-
-- Webcam input
-- Image capture
-- Object recognition
-- QR code recognition
-- Future person detection
-
-### Control
-
-Responsible for:
-
-- Home Assistant integration
-- MQTT
-- Device control
-- Smart-home events
-- Future Roomba movement commands
+- PySide6
+- QML avatar (`Avatar.qml`)
+- Full-screen state-driven interface
 
 ### Remember
 
-Responsible for:
+Persistent file:
 
-- User preferences
-- Conversation summaries
-- System state
-- Optional long-term memory
+```text
+~/.local/share/project-ava/memory.json
+```
 
-## Initial Hardware
+Current memory supports:
 
-- Raspberry Pi 4B, 4 GB RAM
-- DFRobot 7-inch DSI capacitive touchscreen
-- Logitech C270 webcam with microphone
-- External speakers through the 3.5 mm audio output
-- Optional HiFiBerry DAC+ in a later phase
+- User name
+- Single-valued preferences
+- Free-form facts
+- Single-valued residence
+- Residence cleanup/canonicalization
+- Natural-language preference changes
 
-## Initial Deployment Model
+Stored user facts describe the user, not AVA. Response instructions explicitly preserve that person distinction.
 
-The Raspberry Pi acts as a thin client.
+### Tools
 
-The Pi handles:
+Current tools:
 
-- Audio input and output
-- Camera
-- Display
-- Avatar
-- Home Assistant interface
-- Wake word detection
+- `get_current_datetime`
+- `get_weather`
+- `home_assistant_get_state`
+- `home_assistant_find_entities`
+- `home_assistant_control`
 
-Heavy AI processing may initially run in the cloud.
+Home Assistant write access is currently limited to `light` and `switch`.
 
-## First Milestone
+Control feedback verifies the resulting state instead of assuming that an accepted service call is instantly reflected by Home Assistant. Brightness commands separately verify the requested and reported percentage.
 
-AVA v0.2 - First Words
+### See
 
-Goals:
+The C270 camera is physically available but is not part of v1.0-rc1 runtime logic yet. Vision should be added as a separate capture/tool layer rather than being embedded directly into the audio loop.
 
-- Detect microphone input
-- Send speech to an AI service
-- Receive a response
-- Play the response through the speakers
-- Display basic listening and speaking states
+## Historical checkpoints
+
+The older realtime/tool files remain in the repository as regression checkpoints. They are no longer intended as the normal startup path once v1.0-rc1 passes its release gate.
+
+The stable non-Realtime v0.5.1 path is also retained as a fallback reference.
+
+## Release gate
+
+The v1.0 release candidate must pass both pure regression tests and live Raspberry Pi validation. Unit tests cover deterministic memory, entity matching and verification logic; live tests cover audio devices, Realtime streaming, avatar behaviour and real Home Assistant service calls.
+
+See `docs/Roadmap.md` for the live test checklist.
