@@ -45,6 +45,9 @@ Context:
 - Dit is Project AVA.
 - Je draait momenteel als prototype op een Raspberry Pi.
 - Je kunt luisteren, nadenken, spreken en een avatar op een scherm aansturen.
+- Permanente opslag van persoonlijke gegevens is nog niet geïmplementeerd.
+- Zeg dus niet dat je iets tussen sessies zult onthouden tenzij dat echt is toegevoegd.
+- Verzin geen shellcommando's of hardwaremogelijkheden om ontbrekende functies te simuleren.
 - Doe nooit alsof je hardwarefuncties kunt uitvoeren die nog niet daadwerkelijk zijn aangesloten.
 """.strip()
 
@@ -240,7 +243,7 @@ class AVA:
 
         with open(self.RECORDING_FILE, "rb") as audio_file:
             transcript = self.client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
+                model="gpt-4o-transcribe",
                 file=audio_file,
                 language="nl",
                 prompt=TRANSCRIPTION_PROMPT,
@@ -262,8 +265,10 @@ class AVA:
         ]
 
         response = self.client.responses.create(
-            model="gpt-5-mini",
+            model="gpt-5.1",
             input=conversation,
+            reasoning={"effort": "none"},
+            max_output_tokens=160,
         )
 
         reply = response.output_text.strip()
@@ -276,7 +281,7 @@ class AVA:
         print(f"Thinking latency: {time.monotonic() - started:.2f}s")
         return reply
 
-    def speak(self, text):
+    def speak(self, text, turn_started):
         started = time.monotonic()
         self.set_state(AVAState.SPEAKING)
         print("Generating speech...")
@@ -292,6 +297,7 @@ class AVA:
 
         generated = time.monotonic()
         print(f"TTS generation latency: {generated - started:.2f}s")
+        print(f"Time to speech start: {generated - turn_started:.2f}s")
         print("Speaking...")
 
         subprocess.run(
@@ -317,13 +323,13 @@ class AVA:
             return
 
         reply = self.think(text)
-        self.speak(reply)
-        print(f"Total response turn: {time.monotonic() - turn_started:.2f}s")
+        self.speak(reply, turn_started)
+        print(f"Full turn including playback: {time.monotonic() - turn_started:.2f}s")
 
     def start(self):
         print("Project AVA")
-        print("AVA Core v0.5 - Faster Conversation")
-        print("------------------------------------")
+        print("AVA Core v0.5.1 - Latency Tune")
+        print("--------------------------------")
         print("Press Ctrl+C to stop AVA.")
 
         self.set_state(AVAState.IDLE)
