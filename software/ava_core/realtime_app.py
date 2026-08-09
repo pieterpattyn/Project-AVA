@@ -5,6 +5,7 @@ import queue
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,8 @@ API_SAMPLE_RATE = 24000
 CHANNELS = 1
 CHUNK_MS = 20
 PLAYBACK_PREBUFFER_MS = 650
+CALIBRATION_DURATION = 1.5
+MIN_VOICE_DURATION = 0.18
 TRANSCRIPTION_PROMPT = (
     "Belgisch-Nederlands gesprek. De assistent heet AVA. "
     "Veel voorkomende zinnen zijn: Hey AVA, hoe is het met je, wat versta je nu?"
@@ -108,6 +111,42 @@ def resample_pcm16_mono(data, source_rate, target_rate):
     target_positions = np.linspace(0, len(samples) - 1, target_length)
     converted = np.interp(target_positions, source_positions, samples).astype(np.int16)
     return converted.tobytes()
+
+
+def audio_rms(data):
+    samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+    if not len(samples):
+        return 0.0
+    return float(np.sqrt(np.mean(samples * samples)))
+
+
+def calibrate_microphone(microphone, sample_rate):
+    print("Calibrating local speech guard. Keep quiet for a moment...")
+    block_frames = max(1, int(sample_rate * CHUNK_MS / 1000))
+    block_count = max(1, int(CALIBRATION_DURATION * 1000 / CHUNK_MS))
+    levels = []
+
+    with sd.RawInputStream(
+        samplerate=sample_rate,
+        blocksize=block_frames,
+        device=microphone,
+        channels=CHANNELS,
+        dtype="int16",
+    ) as stream:
+        for _ in range(block_count):
+            data, overflowed = stream.read(block_frames)
+            if overflowed:
+                print("Audio overflow during local calibration.")
+            levels.append(audio_rms(bytes(data)))
+
+    noise_floor = float(np.percentile(levels, 70))
+    voice_threshold = max(0.05, noise_floor + 0.025, noise_floor * 1.30)
+    peak_threshold = max(0.08, voice_threshold + 0.015)
+    print(
+        f"Local noise floor: {noise_floor:.3f} | "
+        f"voice: {voice_threshold:.3f} | peak: {peak_threshold:.3f}"
+    )
+    return voice_threshold, peak_threshold
 
 
 def transcript_is_valid(text):
@@ -218,6 +257,8 @@ async def realtime_worker(bridge):
     mic_rate = int(mic_device["default_samplerate"])
     print(f"Microphone native sample rate: {mic_rate} Hz")
 
+    voice_threshold, peak_threshold = calibrate_microphone(microphone, mic_rate)
+
     output_device, output_info = find_output(OUTPUT_NAME)
     output_rate = int(output_info["default_samplerate"])
     print(f"Output native sample rate: {output_rate} Hz")
@@ -232,7 +273,15 @@ async def realtime_worker(bridge):
     last_speech_stopped = None
     first_audio_seen = False
 
+    turn_lock = threading.Lock()
+    server_turn_active = threading.Event()
+    turn_voice_blocks = 0
+    turn_peak = 0.0
+    pending_turns = deque()
+
     def audio_callback(indata, frames, time_info, status):
+        nonlocal turn_voice_blocks, turn_peak
+
         if status:
             print(f"Audio status: {status}")
 
@@ -240,6 +289,13 @@ async def realtime_worker(bridge):
             return
 
         data = bytes(indata)
+        level = audio_rms(data)
+
+        if server_turn_active.is_set():
+            with turn_lock:
+                turn_peak = max(turn_peak, level)
+                if level >= voice_threshold:
+                    turn_voice_blocks += 1
 
         def enqueue():
             if not mic_queue.full():
@@ -278,7 +334,7 @@ async def realtime_worker(bridge):
             }
         )
 
-        print("Project AVA v0.6 - Realtime + Avatar")
+        print("Project AVA v0.6.1 - Realtime + Local Speech Guard")
         print("Connected. Speak naturally. Ctrl+C stops the process.")
         bridge.setState("listening")
 
@@ -303,21 +359,56 @@ async def realtime_worker(bridge):
 
         async def receive_events():
             nonlocal last_speech_stopped, first_audio_seen
+            nonlocal turn_voice_blocks, turn_peak
 
             async for event in connection:
                 if event.type == "input_audio_buffer.speech_started":
+                    with turn_lock:
+                        turn_voice_blocks = 0
+                        turn_peak = 0.0
+                    server_turn_active.set()
                     bridge.setState("listening")
                     print("\nYou: [speaking]")
                     first_audio_seen = False
 
                 elif event.type == "input_audio_buffer.speech_stopped":
+                    server_turn_active.clear()
                     last_speech_stopped = time.monotonic()
+
+                    with turn_lock:
+                        voice_blocks = turn_voice_blocks
+                        peak = turn_peak
+
+                    voice_duration = voice_blocks * CHUNK_MS / 1000.0
+                    pending_turns.append((voice_duration, peak))
                     bridge.setState("thinking")
                     print("You: [finished]")
+                    print(
+                        f"Local voice evidence: {voice_duration:.2f}s | "
+                        f"peak: {peak:.3f}"
+                    )
 
                 elif event.type == "conversation.item.input_audio_transcription.completed":
                     transcript = event.transcript.strip()
                     print(f"You heard as: {transcript}")
+
+                    if pending_turns:
+                        voice_duration, peak = pending_turns.popleft()
+                    else:
+                        voice_duration, peak = 0.0, 0.0
+
+                    local_voice_ok = (
+                        voice_duration >= MIN_VOICE_DURATION
+                        and peak >= peak_threshold
+                    )
+
+                    if not local_voice_ok:
+                        print(
+                            "Ignored weak/non-speech trigger "
+                            f"(voice {voice_duration:.2f}s, peak {peak:.3f})."
+                        )
+                        bridge.setState("listening")
+                        continue
 
                     if not transcript_is_valid(transcript):
                         print("Ignored ghost/empty transcription. Listening...")
