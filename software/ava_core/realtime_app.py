@@ -1,7 +1,9 @@
 import asyncio
 import base64
+import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -28,12 +30,14 @@ CHUNK_MS = 20
 PLAYBACK_PREBUFFER_MS = 650
 CALIBRATION_DURATION = 1.5
 MIN_VOICE_DURATION = 0.18
+MEMORY_FILE = Path.home() / ".local" / "share" / "project-ava" / "memory.json"
+MAX_MEMORY_FACTS = 40
 TRANSCRIPTION_PROMPT = (
     "Belgisch-Nederlands gesprek. De assistent heet AVA. "
     "Veel voorkomende zinnen zijn: Hey AVA, hoe is het met je, wat versta je nu?"
 )
 
-INSTRUCTIONS = """
+BASE_INSTRUCTIONS = """
 Je bent AVA, een persoonlijke slimme assistent.
 Spreek altijd in natuurlijk standaard Belgisch-Nederlands, tenzij de gebruiker expliciet een andere taal vraagt.
 Je bent intelligent, analytisch, direct en betrouwbaar, met subtiele droge humor.
@@ -41,7 +45,138 @@ Begin antwoorden niet met je eigen naam.
 De naam AVA spreek je uit als 'Ava', niet als 'Eva'.
 Geef meestal antwoord in een tot drie korte zinnen.
 Baseer je antwoord op de meest recente tekstboodschap van de gebruiker.
+Als er persistente geheugencontext wordt meegegeven, behandel die als betrouwbare lokale context van Project AVA.
+Zeg nooit dat je iets permanent onthoudt tenzij de lokale geheugenlaag dat daadwerkelijk heeft opgeslagen.
 """.strip()
+
+
+class LocalMemory:
+    def __init__(self, path):
+        self.path = path
+        self.data = {"name": None, "facts": []}
+        self.load()
+
+    def load(self):
+        try:
+            if self.path.exists():
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    name = loaded.get("name")
+                    facts = loaded.get("facts", [])
+                    self.data["name"] = name if isinstance(name, str) and name.strip() else None
+                    self.data["facts"] = [
+                        str(fact).strip()
+                        for fact in facts
+                        if str(fact).strip()
+                    ][:MAX_MEMORY_FACTS]
+        except (OSError, json.JSONDecodeError) as error:
+            print(f"Memory load warning: {error}")
+
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self.path.with_suffix(".tmp")
+        temp_path.write_text(
+            json.dumps(self.data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temp_path.replace(self.path)
+
+    def set_name(self, name):
+        cleaned = name.strip(" .,!?:;\"'")
+        if not cleaned:
+            return False
+        changed = self.data.get("name") != cleaned
+        self.data["name"] = cleaned
+        if changed:
+            self.save()
+        return changed
+
+    def forget_name(self):
+        if not self.data.get("name"):
+            return False
+        self.data["name"] = None
+        self.save()
+        return True
+
+    def add_fact(self, fact):
+        cleaned = fact.strip(" .")
+        if not cleaned:
+            return False
+        existing = {item.casefold() for item in self.data["facts"]}
+        if cleaned.casefold() in existing:
+            return False
+        self.data["facts"].append(cleaned)
+        self.data["facts"] = self.data["facts"][-MAX_MEMORY_FACTS:]
+        self.save()
+        return True
+
+    def forget_fact(self, target):
+        cleaned = target.strip(" .").casefold()
+        if not cleaned:
+            return False
+
+        old = self.data["facts"]
+        new = [
+            fact for fact in old
+            if cleaned not in fact.casefold() and fact.casefold() not in cleaned
+        ]
+        changed = len(new) != len(old)
+        if changed:
+            self.data["facts"] = new
+            self.save()
+        return changed
+
+    def context_text(self):
+        lines = []
+        if self.data.get("name"):
+            lines.append(f"De gebruiker heet {self.data['name']}.")
+        for fact in self.data["facts"]:
+            lines.append(f"Onthouden feit: {fact}.")
+        if not lines:
+            return "Er zijn nog geen persistente herinneringen opgeslagen."
+        return "\n".join(lines)
+
+    def summary(self):
+        name = self.data.get("name") or "onbekend"
+        return f"naam={name}, feiten={len(self.data['facts'])}"
+
+
+def process_memory_request(transcript, memory):
+    text = transcript.strip()
+    lower = text.casefold()
+
+    forget_name_phrases = (
+        "vergeet mijn naam",
+        "vergeet hoe ik heet",
+        "wis mijn naam",
+    )
+    if any(phrase in lower for phrase in forget_name_phrases):
+        changed = memory.forget_name()
+        return "naam verwijderd" if changed else "naam was niet opgeslagen"
+
+    remember_match = re.search(r"\bonthoud(?:t)?\s+dat\s+(.+)", text, re.IGNORECASE)
+    if remember_match:
+        fact = remember_match.group(1).strip()
+        changed = memory.add_fact(fact)
+        return f"feit opgeslagen: {fact}" if changed else f"feit stond al in geheugen: {fact}"
+
+    forget_match = re.search(r"\bvergeet\s+dat\s+(.+)", text, re.IGNORECASE)
+    if forget_match:
+        target = forget_match.group(1).strip()
+        changed = memory.forget_fact(target)
+        return f"feit verwijderd: {target}" if changed else f"geen passend feit gevonden: {target}"
+
+    name_match = re.search(
+        r"\b(?:mijn naam is|ik heet)\s+([A-Za-zÀ-ÖØ-öø-ÿ' -]{2,40}?)(?:[.!?,]|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if name_match:
+        name = " ".join(part.capitalize() for part in name_match.group(1).split())
+        changed = memory.set_name(name)
+        return f"naam opgeslagen: {name}" if changed else f"naam bevestigd: {name}"
+
+    return None
 
 
 class AvatarBridge(QObject):
@@ -253,6 +388,10 @@ class PCMPlayer:
 
 
 async def realtime_worker(bridge):
+    memory = LocalMemory(MEMORY_FILE)
+    print(f"Persistent memory loaded: {memory.summary()}")
+    print(f"Memory file: {MEMORY_FILE}")
+
     microphone, mic_device = find_microphone(MIC_NAME)
     mic_rate = int(mic_device["default_samplerate"])
     print(f"Microphone native sample rate: {mic_rate} Hz")
@@ -308,7 +447,7 @@ async def realtime_worker(bridge):
             session={
                 "type": "realtime",
                 "model": MODEL,
-                "instructions": INSTRUCTIONS,
+                "instructions": BASE_INSTRUCTIONS,
                 "output_modalities": ["audio"],
                 "audio": {
                     "input": {
@@ -334,7 +473,7 @@ async def realtime_worker(bridge):
             }
         )
 
-        print("Project AVA v0.6.1 - Realtime + Local Speech Guard")
+        print("Project AVA v0.7 - Realtime + Persistent Memory")
         print("Connected. Speak naturally. Ctrl+C stops the process.")
         bridge.setState("listening")
 
@@ -415,11 +554,30 @@ async def realtime_worker(bridge):
                         bridge.setState("listening")
                         continue
 
+                    memory_result = process_memory_request(transcript, memory)
+                    if memory_result:
+                        print(f"Memory: {memory_result}")
+
+                    memory_context = memory.context_text()
+                    authoritative_text = (
+                        "[Persistente geheugencontext van Project AVA]\n"
+                        f"{memory_context}\n"
+                    )
+                    if memory_result:
+                        authoritative_text += (
+                            "[Lokale geheugenactie is al uitgevoerd]\n"
+                            f"{memory_result}\n"
+                        )
+                    authoritative_text += (
+                        "[Meest recente boodschap van de gebruiker]\n"
+                        f"{transcript}"
+                    )
+
                     await connection.conversation.item.create(
                         item={
                             "type": "message",
                             "role": "user",
-                            "content": [{"type": "input_text", "text": transcript}],
+                            "content": [{"type": "input_text", "text": authoritative_text}],
                         }
                     )
                     await connection.response.create()
