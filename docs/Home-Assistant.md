@@ -1,6 +1,6 @@
 # Project AVA - Home Assistant setup
 
-AVA v0.9 adds a small REST bridge to Home Assistant while keeping the stable v0.8.2 realtime/audio/memory/weather stack unchanged.
+AVA v1.0-rc1 keeps Home Assistant as the source of truth for smart-home state and control.
 
 ## 1. Create a Home Assistant token
 
@@ -17,23 +17,25 @@ HOME_ASSISTANT_TOKEN=PASTE_YOUR_LONG_LIVED_ACCESS_TOKEN_HERE
 
 Use the actual Home Assistant URL if `homeassistant.local` is not reachable from the Pi.
 
-Do not commit `.env` or the token to Git. Project AVA already ignores `.env`.
+Do not commit `.env` or the token to Git. Project AVA ignores `.env`.
 
-## 3. Run v0.9
+## 3. Run the consolidated release candidate
 
 ```bash
 git pull
-python software/ava_core/realtime_tools_v09.py
+python software/ava_core/realtime_v1.py
 ```
 
 At startup AVA performs a small Home Assistant API preflight. A healthy setup prints something similar to:
 
 ```text
-Project AVA v0.9 - Home Assistant
+Project AVA v1.0-rc1
 Home Assistant: verbonden met http://homeassistant.local:8123
+Tools: tijd/datum + weer + Home Assistant
+Connected. Speak naturally. Ctrl+C stops the process.
 ```
 
-## Supported v0.9 Home Assistant tools
+## Supported Home Assistant tools
 
 ### Read state
 
@@ -47,16 +49,18 @@ Examples:
 
 ### Find entities
 
-AVA can search entity names when the requested device is unclear.
+AVA can search entity names when the requested device is unclear or when the user explicitly asks for a list.
 
 Examples:
 
 - "Welke lampen ken je?"
 - "Welke sensoren heb ik in de keuken?"
 
+For a clear direct command AVA should skip discovery and call the control tool immediately.
+
 ### Control
 
-For the first v0.9 baseline, write access is deliberately limited to `light` and `switch` domains. Supported actions are `turn_on`, `turn_off` and `toggle`. Lights can also use a brightness percentage.
+Write access is deliberately limited to `light` and `switch` domains. Supported actions are `turn_on`, `turn_off` and `toggle`. Lights can also use a brightness percentage.
 
 Examples:
 
@@ -64,8 +68,22 @@ Examples:
 - "Zet de keukenlamp op 30 procent."
 - "Doe de koffiemachine uit." (only when it is exposed as a Home Assistant `switch`)
 
-Locks, alarm systems, covers and other domains are not controlled in v0.9. They can be added later after the basic entity matching and service-call flow has been proven stable on the real installation.
+Locks, alarm systems, covers and other domains are not controlled in v1.0-rc1.
+
+## Verified feedback
+
+A successful Home Assistant service request is not treated as proof that the reported entity state has already caught up. AVA therefore verifies the resulting state for a short period after a control command.
+
+For light brightness, the tool result distinguishes:
+
+- `command_accepted`
+- `state_verified`
+- `brightness_verified`
+- `brightness_requested_pct`
+- `brightness_reported_pct`
+
+If Home Assistant accepted a command but the state endpoint still lags, AVA reports that status confirmation is pending instead of falsely claiming that the command failed.
 
 ## API behaviour
 
-AVA reads entity state with Home Assistant's REST `/api/states` endpoints and controls real devices through `/api/services/<domain>/<service>`. Authentication uses the standard `Authorization: Bearer <token>` header.
+AVA reads entity state with Home Assistant REST state endpoints and controls devices through `/api/services/<domain>/<service>`. Authentication uses the configured Bearer token.
