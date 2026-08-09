@@ -1,56 +1,89 @@
 # Project AVA
 
-**Project AVA** is an open-source AI Home Assistant built around Raspberry Pi.
+**Project AVA** is an open-source AI home assistant built around Raspberry Pi.
 
-The goal is not to create another chatbot, but a modular digital home companion that integrates speech, vision, Home Assistant, and local or cloud-based AI into a single platform.
+The goal is not to create another chatbot, but a modular digital home companion that combines speech, a visual avatar, persistent memory, Home Assistant and cloud/local AI services.
 
-## Vision
+## Current milestone
 
-Project AVA aims to become:
+**AVA v1.0-rc1**
 
-- A voice assistant
-- A visual assistant
-- A Home Assistant companion
-- A modular AI platform
-- A long-term open-source project
+The first release candidate consolidates the proven v0.9.3 stack into one production entry point:
 
-The system should be independent of any specific AI provider or hardware platform. Every major component should be replaceable without redesigning the entire system.
+- OpenAI Realtime voice conversation
+- PySide6/QML avatar states
+- Persistent local memory
+- Current date/time and weather tools
+- Home Assistant discovery and state lookup
+- Verified light/switch control
+- Verified light brightness control
+- Serialized Realtime tool responses
+- Local speech guard and ghost-transcript filtering
 
-## Design Principles
+The earlier `realtime_tools_v08x` and `realtime_tools_v09x` files remain as historical checkpoints. New development should target:
 
-- Modular by design
-- Home Assistant first
-- Local-first whenever practical
-- Cloud when it adds value
-- Hardware independent
-- Open source
+```text
+software/ava_core/realtime_v1.py
+```
 
-## Current Hardware
+## Run
 
-- Raspberry Pi 4B (4 GB)
-- DFRobot 7" DSI Capacitive Touchscreen
-- Logitech C270 webcam with microphone
+From the project virtual environment:
+
+```bash
+git pull
+python software/ava_core/realtime_v1.py
+```
+
+Home Assistant credentials are read from the local `.env` file:
+
+```env
+OPENAI_API_KEY=...
+HOME_ASSISTANT_URL=http://homeassistant.local:8123
+HOME_ASSISTANT_TOKEN=...
+```
+
+Never commit `.env` or access tokens.
+
+## Tests
+
+Pure memory/entity/verification logic has a small regression suite:
+
+```bash
+python -m unittest discover -s software/ava_core/tests -v
+```
+
+The final release gate is still a live Raspberry Pi test because audio devices, Realtime streaming and Home Assistant service calls cannot be meaningfully proven by unit tests alone. Humans have somehow invented hardware.
+
+## Current hardware
+
+- Raspberry Pi 4B, 4 GB
+- DFRobot 7-inch DSI capacitive touchscreen
+- Logitech C270 webcam + microphone
 - External speakers
 - Home Assistant
 
-## Project Status
+## Design principles
 
-🚧 Early development
+- Modular by design
+- Home Assistant remains the source of truth for home automation
+- Local-first where practical
+- Cloud services where they add clear value
+- AI-provider components should remain replaceable
+- Preserve known-good checkpoints during risky experiments
 
-Current milestone:
+## Next after v1.0
 
-**AVA v0.1 – First Breath**
+The release candidate should be tested as a whole before adding another major feature. Post-v1 candidates include:
 
-Hardware validation completed.
+- Wake word
+- Barge-in / interruption while AVA speaks
+- Camera/vision integration
+- Broader Home Assistant domains with explicit safety rules
+- Cleaner packaging/service startup
+- Mobile/robot body experiments
 
-## Roadmap
-
-- v0.1 First Breath
-- v0.2 First Words
-- v0.3 First Face
-- v0.4 First Vision
-- v0.5 Smart Home
-- v1.0 AVA
+See `docs/Roadmap.md` and `docs/Architecture.md` for details.
 
 ---
 
