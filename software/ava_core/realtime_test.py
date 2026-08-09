@@ -19,7 +19,6 @@ API_SAMPLE_RATE = 24000
 CHANNELS = 1
 CHUNK_MS = 20
 PLAYBACK_PREBUFFER_MS = 650
-TRANSCRIPTION_PROMPT = "Belgisch-Nederlands gesprek. De assistent heet AVA."
 
 INSTRUCTIONS = """
 Je bent AVA, een persoonlijke slimme assistent.
@@ -28,6 +27,7 @@ Je bent intelligent, analytisch, direct en betrouwbaar, met subtiele droge humor
 Begin antwoorden niet met je eigen naam.
 De naam AVA spreek je uit als 'Ava', niet als 'Eva'.
 Geef meestal antwoord in een tot drie korte zinnen.
+Baseer je antwoord op de meest recente tekstboodschap van de gebruiker.
 """.strip()
 
 
@@ -105,14 +105,6 @@ class PCMPlayer:
     def finish_response(self):
         self.queue.put(self.RESPONSE_DONE)
 
-    def clear(self):
-        while True:
-            try:
-                self.queue.get_nowait()
-            except queue.Empty:
-                break
-        self.playback_active.clear()
-
     def stop(self):
         self.stop_event.set()
         self.queue.put(None)
@@ -169,11 +161,7 @@ class PCMPlayer:
                             self.playback_active.clear()
                     continue
 
-                converted = resample_pcm16_mono(
-                    item,
-                    API_SAMPLE_RATE,
-                    self.output_rate,
-                )
+                converted = resample_pcm16_mono(item, API_SAMPLE_RATE, self.output_rate)
 
                 with buffer_lock:
                     pcm_buffer.extend(converted)
@@ -231,13 +219,10 @@ async def main():
                         "transcription": {
                             "model": "gpt-4o-transcribe",
                             "language": "nl",
-                            "prompt": TRANSCRIPTION_PROMPT,
                         },
                         "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.5,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 500,
+                            "type": "semantic_vad",
+                            "eagerness": "low",
                             "create_response": False,
                             "interrupt_response": False,
                         },
@@ -250,8 +235,8 @@ async def main():
             }
         )
 
-        print("Project AVA - Realtime guarded-response test")
-        print("Speak naturally. Ctrl+C stops the test.")
+        print("Project AVA - Realtime semantic-turn test")
+        print("Speak naturally, including short thinking pauses. Ctrl+C stops the test.")
         print("Connected. Listening...")
 
         async def send_microphone():
@@ -289,10 +274,22 @@ async def main():
                     transcript = event.transcript.strip()
                     print(f"You heard as: {transcript}")
 
-                    if transcript_is_valid(transcript):
-                        await connection.response.create()
-                    else:
+                    if not transcript_is_valid(transcript):
                         print("Ignored ghost/empty transcription. Listening...")
+                        continue
+
+                    # The realtime model consumes raw audio directly, while the
+                    # transcription service is separate. Add the validated transcript
+                    # as the authoritative latest user message so the response follows
+                    # what was actually recognized in Dutch.
+                    await connection.conversation.item.create(
+                        item={
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": transcript}],
+                        }
+                    )
+                    await connection.response.create()
 
                 elif event.type == "response.output_audio.delta":
                     if not first_audio_seen:
