@@ -14,10 +14,11 @@ load_dotenv()
 
 MODEL = "gpt-realtime-2"
 MIC_NAME = "C270"
+OUTPUT_NAME = "Headphones"
 API_SAMPLE_RATE = 24000
 CHANNELS = 1
 CHUNK_MS = 20
-OUTPUT_DEVICE = "plughw:0,0"
+PLAYBACK_PREBUFFER_MS = 300
 
 INSTRUCTIONS = """
 Je bent AVA, een persoonlijke slimme assistent.
@@ -37,6 +38,23 @@ def find_microphone(name):
     raise RuntimeError(f"Microphone containing '{name}' not found.")
 
 
+def find_output(name):
+    candidates = []
+    for index, device in enumerate(sd.query_devices()):
+        if device["max_output_channels"] > 0:
+            candidates.append((index, device))
+            if name.lower() in device["name"].lower():
+                print(f"Output: {device['name']} (device {index})")
+                return index, device
+
+    if candidates:
+        index, device = candidates[0]
+        print(f"Output fallback: {device['name']} (device {index})")
+        return index, device
+
+    raise RuntimeError("No audio output device found.")
+
+
 def resample_pcm16_mono(data, source_rate, target_rate):
     if source_rate == target_rate:
         return data
@@ -53,17 +71,25 @@ def resample_pcm16_mono(data, source_rate, target_rate):
 
 
 class PCMPlayer:
-    def __init__(self):
+    RESPONSE_DONE = object()
+
+    def __init__(self, output_device, output_rate):
+        self.output_device = output_device
+        self.output_rate = output_rate
         self.queue = queue.Queue()
         self.stop_event = threading.Event()
-        self.process = None
+        self.playback_active = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
         self.thread.start()
 
     def add(self, data):
+        self.playback_active.set()
         self.queue.put(data)
+
+    def finish_response(self):
+        self.queue.put(self.RESPONSE_DONE)
 
     def clear(self):
         while True:
@@ -71,6 +97,7 @@ class PCMPlayer:
                 self.queue.get_nowait()
             except queue.Empty:
                 break
+        self.playback_active.clear()
 
     def stop(self):
         self.stop_event.set()
@@ -78,38 +105,55 @@ class PCMPlayer:
         self.thread.join(timeout=2)
 
     def _run(self):
-        import subprocess
+        prebuffer_bytes = int(API_SAMPLE_RATE * 2 * PLAYBACK_PREBUFFER_MS / 1000)
+        api_buffer = bytearray()
+        response_done = False
 
-        self.process = subprocess.Popen(
-            [
-                "aplay",
-                "-q",
-                "-D",
-                OUTPUT_DEVICE,
-                "-t",
-                "raw",
-                "-f",
-                "S16_LE",
-                "-r",
-                str(API_SAMPLE_RATE),
-                "-c",
-                "1",
-            ],
-            stdin=subprocess.PIPE,
-        )
-
-        try:
+        with sd.RawOutputStream(
+            samplerate=self.output_rate,
+            device=self.output_device,
+            channels=1,
+            dtype="int16",
+            blocksize=0,
+            latency="high",
+        ) as stream:
             while not self.stop_event.is_set():
-                data = self.queue.get()
-                if data is None:
+                item = self.queue.get()
+                if item is None:
                     break
-                if self.process.stdin:
-                    self.process.stdin.write(data)
-                    self.process.stdin.flush()
-        finally:
-            if self.process.stdin:
-                self.process.stdin.close()
-            self.process.wait(timeout=2)
+
+                if item is self.RESPONSE_DONE:
+                    response_done = True
+                else:
+                    api_buffer.extend(item)
+
+                if not response_done and len(api_buffer) < prebuffer_bytes:
+                    continue
+
+                while api_buffer:
+                    # Feed roughly 40 ms at a time. A larger block and the initial
+                    # jitter buffer keep the hardware supplied during network jitter.
+                    api_frames = int(API_SAMPLE_RATE * 0.04)
+                    api_bytes = api_frames * 2
+
+                    if len(api_buffer) < api_bytes and not response_done:
+                        break
+
+                    take = min(api_bytes, len(api_buffer))
+                    chunk = bytes(api_buffer[:take])
+                    del api_buffer[:take]
+                    output_chunk = resample_pcm16_mono(
+                        chunk,
+                        API_SAMPLE_RATE,
+                        self.output_rate,
+                    )
+                    underflowed = stream.write(output_chunk)
+                    if underflowed:
+                        print("Playback underflow detected.")
+
+                if response_done and not api_buffer:
+                    response_done = False
+                    self.playback_active.clear()
 
 
 async def main():
@@ -117,8 +161,12 @@ async def main():
     mic_rate = int(mic_device["default_samplerate"])
     print(f"Microphone native sample rate: {mic_rate} Hz")
 
+    output_device, output_info = find_output(OUTPUT_NAME)
+    output_rate = int(output_info["default_samplerate"])
+    print(f"Output native sample rate: {output_rate} Hz")
+
     client = AsyncOpenAI()
-    player = PCMPlayer()
+    player = PCMPlayer(output_device, output_rate)
     player.start()
 
     chunk_frames = max(1, int(mic_rate * CHUNK_MS / 1000))
@@ -130,6 +178,12 @@ async def main():
     def audio_callback(indata, frames, time_info, status):
         if status:
             print(f"Audio status: {status}")
+
+        # For this stability test we do not stream the speaker output back into
+        # the model. Proper echo cancellation / barge-in comes later.
+        if player.playback_active.is_set():
+            return
+
         data = bytes(indata)
 
         def enqueue():
@@ -154,7 +208,7 @@ async def main():
                             "prefix_padding_ms": 300,
                             "silence_duration_ms": 500,
                             "create_response": True,
-                            "interrupt_response": True,
+                            "interrupt_response": False,
                         },
                     },
                     "output": {
@@ -165,7 +219,7 @@ async def main():
             }
         )
 
-        print("Project AVA - Realtime test")
+        print("Project AVA - Realtime stability test")
         print("Speak naturally. Ctrl+C stops the test.")
         print("Connected. Listening...")
 
@@ -180,6 +234,10 @@ async def main():
             ):
                 while True:
                     data = await mic_queue.get()
+
+                    if player.playback_active.is_set():
+                        continue
+
                     data = resample_pcm16_mono(data, mic_rate, API_SAMPLE_RATE)
                     encoded = base64.b64encode(data).decode("ascii")
                     await connection.input_audio_buffer.append(audio=encoded)
@@ -191,7 +249,6 @@ async def main():
                 if event.type == "input_audio_buffer.speech_started":
                     print("\nYou: [speaking]")
                     first_audio_seen = False
-                    player.clear()
 
                 elif event.type == "input_audio_buffer.speech_stopped":
                     last_speech_stopped = time.monotonic()
@@ -213,7 +270,8 @@ async def main():
                     print()
 
                 elif event.type == "response.done":
-                    print("Listening...")
+                    player.finish_response()
+                    print("Listening after playback...")
 
                 elif event.type == "error":
                     print(f"Realtime error: {event.error.message}")
