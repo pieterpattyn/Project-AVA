@@ -4,7 +4,7 @@
 
 AVA is a modular AI home assistant running on a Raspberry Pi-based console.
 
-The current release candidate combines:
+The current stable v1.0 runtime combines:
 
 - Realtime voice interaction
 - Visual avatar state
@@ -22,9 +22,9 @@ Future modules include vision, wake word, barge-in and mobile hardware.
 4. Local processing is preferred where practical.
 5. Cloud services are used where they provide a clear capability or latency advantage.
 6. Safety-sensitive write tools require explicit scope and verification.
-7. Known-good checkpoints are preserved while experimental branches evolve.
+7. Known-good checkpoints are preserved while experimental work evolves.
 
-## Current v1.0-rc1 runtime
+## Current v1.0 runtime
 
 Primary entry point:
 
@@ -44,7 +44,7 @@ software/ava_core/realtime_v1.py
 - Ghost-transcript rejection
 - Raw server audio item replaced by the validated transcript as authoritative user input
 
-During AVA playback the microphone path is currently suppressed. This keeps the baseline stable but means barge-in is not yet supported.
+During AVA playback the microphone path is currently suppressed. This keeps the v1.0 baseline stable but means barge-in is not yet supported.
 
 ### Think
 
@@ -53,6 +53,20 @@ During AVA playback the microphone path is currently suppressed. This keeps the 
 - Local persistent memory context
 - Function/tool selection
 - Serialized tool follow-up responses so only one Realtime response is active at a time
+- Local high-precision tool-turn router
+
+#### Silent tool routing
+
+v1.0 no longer relies only on an instruction telling the model not to speak before a tool call.
+
+Before creating a response, AVA classifies the validated user transcript into one of two paths:
+
+1. **Normal conversation** uses direct audio output with tool use disabled.
+2. **Likely tool turns** use a text-only response with tool use required.
+
+The text-only tool pass can emit one or more function calls but cannot produce spoken audio. After all tool outputs are attached and that response is complete, AVA creates one compact audio follow-up with further tool use disabled.
+
+This keeps normal conversation low-latency while structurally preventing weather/time/Home Assistant turns from saying things like "ik check even" before actually doing the work.
 
 ### Speak
 
@@ -61,6 +75,7 @@ During AVA playback the microphone path is currently suppressed. This keeps the 
 - Raspberry Pi headphone output
 - Prebuffered playback for stable audio
 - Avatar state transitions for listening/thinking/speaking
+- Spoken tool answers only after tool results are available
 
 ### Display
 
@@ -103,16 +118,18 @@ Control feedback verifies the resulting state instead of assuming that an accept
 
 ### See
 
-The C270 camera is physically available but is not part of v1.0-rc1 runtime logic yet. Vision should be added as a separate capture/tool layer rather than being embedded directly into the audio loop.
+The C270 camera is physically available but is not part of v1.0 runtime logic yet. Vision should be added as a separate capture/tool layer rather than being embedded directly into the audio loop.
 
 ## Historical checkpoints
 
-The older realtime/tool files remain in the repository as regression checkpoints. They are no longer intended as the normal startup path once v1.0-rc1 passes its release gate.
+The older realtime/tool files remain in the repository as regression checkpoints. They are no longer intended as the normal startup path.
 
 The stable non-Realtime v0.5.1 path is also retained as a fallback reference.
 
-## Release gate
+## Validation
 
-The v1.0 release candidate must pass both pure regression tests and live Raspberry Pi validation. Unit tests cover deterministic memory, entity matching and verification logic; live tests cover audio devices, Realtime streaming, avatar behaviour and real Home Assistant service calls.
+v1.0 passed the deterministic regression suite and a live Raspberry Pi validation covering persistent memory, residence-based weather, Home Assistant on/off control, multiple brightness percentages, avatar/audio behaviour and clean shutdown.
 
-See `docs/Roadmap.md` for the live test checklist.
+After changes to audio, Realtime routing or Home Assistant control, rerun both the unit tests and an appropriate live hardware smoke test.
+
+See `docs/Roadmap.md` for post-v1 work.
