@@ -1,10 +1,10 @@
 import asyncio
+import audioop
 import base64
 import queue
 import threading
 import time
 
-import numpy as np
 import sounddevice as sd
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -14,8 +14,7 @@ load_dotenv()
 
 MODEL = "gpt-realtime-2"
 MIC_NAME = "C270"
-INPUT_SAMPLE_RATE = 24000
-OUTPUT_SAMPLE_RATE = 24000
+API_SAMPLE_RATE = 24000
 CHANNELS = 1
 CHUNK_MS = 20
 OUTPUT_DEVICE = "plughw:0,0"
@@ -34,7 +33,7 @@ def find_microphone(name):
     for index, device in enumerate(sd.query_devices()):
         if name.lower() in device["name"].lower() and device["max_input_channels"] > 0:
             print(f"Microphone: {device['name']} (device {index})")
-            return index
+            return index, device
     raise RuntimeError(f"Microphone containing '{name}' not found.")
 
 
@@ -77,7 +76,7 @@ class PCMPlayer:
                 "-f",
                 "S16_LE",
                 "-r",
-                str(OUTPUT_SAMPLE_RATE),
+                str(API_SAMPLE_RATE),
                 "-c",
                 "1",
             ],
@@ -99,16 +98,20 @@ class PCMPlayer:
 
 
 async def main():
-    microphone = find_microphone(MIC_NAME)
+    microphone, mic_device = find_microphone(MIC_NAME)
+    mic_rate = int(mic_device["default_samplerate"])
+    print(f"Microphone native sample rate: {mic_rate} Hz")
+
     client = AsyncOpenAI()
     player = PCMPlayer()
     player.start()
 
-    chunk_frames = int(INPUT_SAMPLE_RATE * CHUNK_MS / 1000)
+    chunk_frames = max(1, int(mic_rate * CHUNK_MS / 1000))
     loop = asyncio.get_running_loop()
     mic_queue = asyncio.Queue(maxsize=100)
     last_speech_stopped = None
     first_audio_seen = False
+    rate_state = None
 
     def audio_callback(indata, frames, time_info, status):
         if status:
@@ -130,7 +133,7 @@ async def main():
                 "output_modalities": ["audio"],
                 "audio": {
                     "input": {
-                        "format": {"type": "audio/pcm", "rate": INPUT_SAMPLE_RATE},
+                        "format": {"type": "audio/pcm", "rate": API_SAMPLE_RATE},
                         "turn_detection": {
                             "type": "server_vad",
                             "threshold": 0.5,
@@ -141,7 +144,7 @@ async def main():
                         },
                     },
                     "output": {
-                        "format": {"type": "audio/pcm", "rate": OUTPUT_SAMPLE_RATE},
+                        "format": {"type": "audio/pcm", "rate": API_SAMPLE_RATE},
                         "voice": "marin",
                     },
                 },
@@ -153,8 +156,10 @@ async def main():
         print("Connected. Listening...")
 
         async def send_microphone():
+            nonlocal rate_state
+
             with sd.RawInputStream(
-                samplerate=INPUT_SAMPLE_RATE,
+                samplerate=mic_rate,
                 blocksize=chunk_frames,
                 device=microphone,
                 channels=CHANNELS,
@@ -163,6 +168,17 @@ async def main():
             ):
                 while True:
                     data = await mic_queue.get()
+
+                    if mic_rate != API_SAMPLE_RATE:
+                        data, rate_state = audioop.ratecv(
+                            data,
+                            2,
+                            CHANNELS,
+                            mic_rate,
+                            API_SAMPLE_RATE,
+                            rate_state,
+                        )
+
                     encoded = base64.b64encode(data).decode("ascii")
                     await connection.input_audio_buffer.append(audio=encoded)
 
