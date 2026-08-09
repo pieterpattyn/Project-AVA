@@ -40,21 +40,14 @@ class AVA:
                 name.lower() in device["name"].lower()
                 and device["max_input_channels"] > 0
             ):
-                print(
-                    f"Microphone: {device['name']} "
-                    f"(device {index})"
-                )
+                print(f"Microphone: {device['name']} (device {index})")
                 return index
 
-        raise RuntimeError(
-            f"Microphone containing '{name}' not found."
-        )
+        raise RuntimeError(f"Microphone containing '{name}' not found.")
 
     def record_audio(self):
         self.set_state(AVAState.LISTENING)
-        print(
-            f"Listening for {self.RECORDING_DURATION} seconds..."
-        )
+        print(f"Listening for {self.RECORDING_DURATION} seconds...")
 
         audio = sd.rec(
             int(self.RECORDING_DURATION * self.SAMPLE_RATE),
@@ -63,7 +56,6 @@ class AVA:
             dtype="int16",
             device=self.microphone,
         )
-
         sd.wait()
 
         with wave.open(self.RECORDING_FILE, "wb") as wav:
@@ -72,9 +64,7 @@ class AVA:
             wav.setframerate(self.SAMPLE_RATE)
             wav.writeframes(audio.tobytes())
 
-        peak = float(
-            np.max(np.abs(audio.astype(np.float32))) / 32768.0
-        )
+        peak = float(np.max(np.abs(audio.astype(np.float32))) / 32768.0)
         print(f"Microphone peak: {peak:.3f}")
 
     def transcribe(self):
@@ -89,10 +79,10 @@ class AVA:
                 prompt=(
                     "Dit is standaard Nederlands uit België. "
                     "De assistent heet AVA. "
-                    "Verwacht nederlandse zinnen en woorden zoals: "
-                    "AVA, stel jezelf voor, wie je bent, wat kun je, "
+                    "Verwacht Nederlandse zinnen en woorden zoals: "
+                    "AVA, stel jezelf voor, wie ben je, wat kun je, "
                     "zet het licht aan, hoe is het weer."
-                 )
+                ),
             )
 
         print(f"AVA heard: {transcript.text}")
@@ -112,10 +102,7 @@ class AVA:
                         "Je bent rustig, analytisch en hebt droge humor."
                     ),
                 },
-                {
-                    "role": "user",
-                    "content": text,
-                },
+                {"role": "user", "content": text},
             ],
         )
 
@@ -149,17 +136,34 @@ class AVA:
     def conversation_once(self):
         self.record_audio()
         text = self.transcribe()
+
+        if not text.strip():
+            print("No speech detected.")
+            return
+
         reply = self.think(text)
         self.speak(reply)
-        self.set_state(AVAState.IDLE)
 
     def start(self):
         print("Project AVA")
         print("AVA Core v0.2 - First Words")
         print("----------------------------")
+        print("Press Ctrl+C to stop AVA.")
 
         self.set_state(AVAState.IDLE)
-        self.conversation_once()
+
+        try:
+            while True:
+                try:
+                    self.conversation_once()
+                except Exception as error:
+                    print(f"\nConversation error: {error}")
+                finally:
+                    self.set_state(AVAState.IDLE)
+        except KeyboardInterrupt:
+            print("\nStopping AVA...")
+            self.set_state(AVAState.IDLE)
+            print("Goodbye.")
 
 
 if __name__ == "__main__":
