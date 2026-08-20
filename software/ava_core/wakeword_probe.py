@@ -24,6 +24,7 @@ import realtime_app as core
 WAKE_SAMPLE_RATE = 16_000
 WAKE_SAMPLE_WIDTH = 2
 WAKE_CHANNELS = 1
+WAKE_WARMUP_SECONDS = 0.40
 DEFAULT_WAKE_URI = os.getenv("AVA_WAKEWORD_URI", "tcp://127.0.0.1:10400")
 DEFAULT_WAKE_WORD = os.getenv("AVA_WAKEWORD_NAME", "hey_ava")
 
@@ -124,6 +125,19 @@ async def detect_once(uri, wake_word, microphone_name=core.MIC_NAME):
                 server_error["value"] = str(error)
                 finished.set()
 
+    async def send_audio(raw):
+        pcm16 = core.resample_pcm16_mono(raw, mic_rate, WAKE_SAMPLE_RATE)
+        await send_event(
+            writer,
+            "audio-chunk",
+            {
+                "rate": WAKE_SAMPLE_RATE,
+                "width": WAKE_SAMPLE_WIDTH,
+                "channels": WAKE_CHANNELS,
+            },
+            pcm16,
+        )
+
     receiver = asyncio.create_task(receive_events())
 
     try:
@@ -138,7 +152,6 @@ async def detect_once(uri, wake_word, microphone_name=core.MIC_NAME):
             },
         )
 
-        print("Luisteren... zeg 'Hey AVA'. Ctrl+C stopt.")
         with sd.RawInputStream(
             samplerate=mic_rate,
             blocksize=0,
@@ -148,23 +161,29 @@ async def detect_once(uri, wake_word, microphone_name=core.MIC_NAME):
             dtype="int16",
             callback=audio_callback,
         ):
+            # Let the USB/PortAudio stream settle and feed a short slice of
+            # ambient audio to openWakeWord before telling the user it is ready.
+            # This avoids clipping the start of an immediate "Hey AVA".
+            warmup_deadline = loop.time() + WAKE_WARMUP_SECONDS
+            while not finished.is_set() and loop.time() < warmup_deadline:
+                remaining = max(0.0, warmup_deadline - loop.time())
+                try:
+                    raw = await asyncio.wait_for(
+                        audio_queue.get(), timeout=min(0.25, remaining)
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                await send_audio(raw)
+
+            if not finished.is_set():
+                print("Luisteren... zeg 'Hey AVA'. Ctrl+C stopt.")
+
             while not finished.is_set():
                 try:
                     raw = await asyncio.wait_for(audio_queue.get(), timeout=0.25)
                 except asyncio.TimeoutError:
                     continue
-
-                pcm16 = core.resample_pcm16_mono(raw, mic_rate, WAKE_SAMPLE_RATE)
-                await send_event(
-                    writer,
-                    "audio-chunk",
-                    {
-                        "rate": WAKE_SAMPLE_RATE,
-                        "width": WAKE_SAMPLE_WIDTH,
-                        "channels": WAKE_CHANNELS,
-                    },
-                    pcm16,
-                )
+                await send_audio(raw)
 
         try:
             await send_event(writer, "audio-stop")
