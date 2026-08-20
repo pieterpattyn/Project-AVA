@@ -24,7 +24,6 @@ import realtime_app as core
 WAKE_SAMPLE_RATE = 16_000
 WAKE_SAMPLE_WIDTH = 2
 WAKE_CHANNELS = 1
-WAKE_FRAME_MS = 80
 DEFAULT_WAKE_URI = os.getenv("AVA_WAKEWORD_URI", "tcp://127.0.0.1:10400")
 DEFAULT_WAKE_WORD = os.getenv("AVA_WAKEWORD_NAME", "hey_ava")
 
@@ -91,9 +90,8 @@ async def detect_once(uri, wake_word, microphone_name=core.MIC_NAME):
 
     microphone, mic_info = core.find_microphone(microphone_name)
     mic_rate = int(mic_info["default_samplerate"])
-    chunk_frames = max(1, int(mic_rate * WAKE_FRAME_MS / 1000))
     loop = asyncio.get_running_loop()
-    audio_queue = asyncio.Queue(maxsize=50)
+    audio_queue = asyncio.Queue(maxsize=200)
     finished = asyncio.Event()
     detected_name = {"value": None}
     server_error = {"value": None}
@@ -143,7 +141,8 @@ async def detect_once(uri, wake_word, microphone_name=core.MIC_NAME):
         print("Luisteren... zeg 'Hey AVA'. Ctrl+C stopt.")
         with sd.RawInputStream(
             samplerate=mic_rate,
-            blocksize=chunk_frames,
+            blocksize=0,
+            latency="high",
             device=microphone,
             channels=core.CHANNELS,
             dtype="int16",
