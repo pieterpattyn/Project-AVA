@@ -12,3 +12,7 @@ services:
       - tcp://0.0.0.0:10400
       - --custom-model-dir
       - /custom
+      - --threshold
+      - "0.35"
+      - --trigger-level
+      - "1"
