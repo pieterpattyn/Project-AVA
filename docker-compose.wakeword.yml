@@ -13,6 +13,6 @@ services:
       - --custom-model-dir
       - /custom
       - --threshold
-      - "0.35"
+      - "0.20"
       - --trigger-level
       - "1"
