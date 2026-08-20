@@ -13,10 +13,16 @@ before local wake-word detection is armed again.
 The local speech-guard calibration is performed once when v1.1 starts and then
 reused for every Realtime session. This removes the 1.5 second calibration from
 the wake-to-listening path while leaving the proven v1.0 module unchanged.
+
+v1.1 also applies two session-local safety refinements around the frozen v1.0
+runtime: a slightly shorter minimum local voice duration for noisy rooms, and a
+residence-memory guard that prevents casual broad location context from
+silently replacing an already stored specific residence.
 """
 
 import argparse
 import asyncio
+import re
 import signal
 import sys
 import threading
@@ -38,6 +44,58 @@ DEFAULT_FOLLOWUP_TIMEOUT = 8.0
 DEFAULT_SPEECH_GRACE = 30.0
 REARM_DELAY_SECONDS = 0.45
 MONITOR_INTERVAL_SECONDS = 0.05
+V11_MIN_VOICE_DURATION = 0.10
+
+_EXPLICIT_RESIDENCE_CHANGE_PATTERNS = (
+    r"\bik\s+woon\s+(?:nu|voortaan)\s+(?:in|te)\b",
+    r"\bvanaf\s+nu\s+woon\s+ik\s+(?:in|te)\b",
+    r"\bik\s+ben\s+verhuisd\s+(?:naar|van\b.+\bnaar)\b",
+    r"\bmijn\s+woonplaats\s+is\b",
+    r"\b(?:verander|wijzig|pas|zet)\s+(?:mijn\s+)?woonplaats\b",
+    r"\b(?:onthoud|bewaar)\b.+\bik\s+woon\s+(?:in|te)\b",
+)
+
+
+def explicit_residence_change(transcript):
+    """Return True only when the user clearly intends to replace residence."""
+
+    text = " ".join(str(transcript or "").strip().split())
+    return any(
+        re.search(pattern, text, re.IGNORECASE)
+        for pattern in _EXPLICIT_RESIDENCE_CHANGE_PATTERNS
+    )
+
+
+def guard_memory_processor(transcript, memory, processor):
+    """Preserve an existing residence unless replacement intent is explicit.
+
+    v1.0 intentionally treats a plain sentence such as ``ik woon in X`` as a
+    residence update. In a longer conversation that can be too eager: saying
+    ``ik woon in België`` as geographic context should not replace a more
+    specific stored residence such as Hooglede. v1.1 therefore snapshots the
+    residence, lets the frozen v1.0 processor run, and rolls back only a casual
+    replacement. First-time residence learning remains unchanged.
+    """
+
+    before = v1._residence_from_memory(memory)
+    actions = list(processor(transcript, memory) or [])
+    after = v1._residence_from_memory(memory)
+
+    changed = (
+        bool(before)
+        and bool(after)
+        and before.casefold() != after.casefold()
+    )
+    if changed and not explicit_residence_change(transcript):
+        v1._set_residence(memory, before)
+        actions = [
+            action
+            for action in actions
+            if not str(action).casefold().startswith("woonplaats ")
+        ]
+        print(f"Memory guard: specifieke woonplaats behouden ({before}).")
+
+    return actions
 
 
 class CalibrationCache:
@@ -80,15 +138,29 @@ class CalibrationCache:
 
 
 @contextmanager
-def cached_calibration(cache):
-    """Temporarily let untouched v1.0 consume the cached v1.1 thresholds."""
+def v11_session_patches(cache):
+    """Temporarily apply v1.1 refinements around the untouched v1.0 worker."""
 
-    original = v1.core.calibrate_microphone
+    original_calibrator = v1.core.calibrate_microphone
+    original_min_voice_duration = v1.core.MIN_VOICE_DURATION
+    original_memory_processor = v1.process_memory_request
+
+    def guarded_memory_processor(transcript, memory):
+        return guard_memory_processor(
+            transcript,
+            memory,
+            original_memory_processor,
+        )
+
     v1.core.calibrate_microphone = cache.calibrate
+    v1.core.MIN_VOICE_DURATION = V11_MIN_VOICE_DURATION
+    v1.process_memory_request = guarded_memory_processor
     try:
         yield
     finally:
-        v1.core.calibrate_microphone = original
+        v1.process_memory_request = original_memory_processor
+        v1.core.MIN_VOICE_DURATION = original_min_voice_duration
+        v1.core.calibrate_microphone = original_calibrator
 
 
 class SessionIdleTracker:
@@ -247,7 +319,7 @@ async def run_realtime_until_idle(bridge, tracker, calibration):
     """Run the proven v1 worker until it ends or the idle tracker expires."""
 
     tracker.start_session()
-    with cached_calibration(calibration):
+    with v11_session_patches(calibration):
         realtime_task = asyncio.create_task(v1.realtime_worker(bridge))
 
         try:
