@@ -3,12 +3,16 @@
 The proven v1.0 Realtime runtime remains untouched. This module owns the
 long-lived avatar and repeatedly cycles through:
 
-    idle -> local Hey AVA detection -> v1.0 Realtime session -> idle
+    idle -> local Hey AVA detection -> waking -> v1.0 Realtime session -> idle
 
 A small lifecycle bridge observes AVA state transitions. When Realtime returns
 to the listening state and no follow-up arrives before the configured timeout,
 the v1.0 coroutine is cancelled cleanly, releasing microphone/output resources
 before local wake-word detection is armed again.
+
+The local speech-guard calibration is performed once when v1.1 starts and then
+reused for every Realtime session. This removes the 1.5 second calibration from
+the wake-to-listening path while leaving the proven v1.0 module unchanged.
 """
 
 import argparse
@@ -17,6 +21,7 @@ import signal
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, QUrl, Slot
@@ -33,6 +38,57 @@ DEFAULT_FOLLOWUP_TIMEOUT = 8.0
 DEFAULT_SPEECH_GRACE = 30.0
 REARM_DELAY_SECONDS = 0.45
 MONITOR_INTERVAL_SECONDS = 0.05
+
+
+class CalibrationCache:
+    """Keep one local speech-guard calibration for the v1.1 process lifetime."""
+
+    def __init__(self, microphone_name):
+        self.microphone_name = microphone_name
+        self._original_calibrator = v1.core.calibrate_microphone
+        self._sample_rate = None
+        self._thresholds = None
+
+    def prepare(self):
+        if self._thresholds is not None:
+            return self._thresholds
+
+        microphone, mic_info = v1.core.find_microphone(self.microphone_name)
+        sample_rate = int(mic_info["default_samplerate"])
+        print("Speech guard calibration: eenmalig bij programmastart.")
+        self._thresholds = self._original_calibrator(microphone, sample_rate)
+        self._sample_rate = sample_rate
+        return self._thresholds
+
+    def calibrate(self, microphone, sample_rate):
+        """Drop-in replacement for core.calibrate_microphone during a session."""
+
+        sample_rate = int(sample_rate)
+        if self._thresholds is None:
+            self._thresholds = self._original_calibrator(microphone, sample_rate)
+            self._sample_rate = sample_rate
+            return self._thresholds
+
+        if self._sample_rate != sample_rate:
+            print("Speech guard: sample rate gewijzigd; opnieuw kalibreren.")
+            self._thresholds = self._original_calibrator(microphone, sample_rate)
+            self._sample_rate = sample_rate
+            return self._thresholds
+
+        print("Speech guard: startup calibration hergebruikt.")
+        return self._thresholds
+
+
+@contextmanager
+def cached_calibration(cache):
+    """Temporarily let untouched v1.0 consume the cached v1.1 thresholds."""
+
+    original = v1.core.calibrate_microphone
+    v1.core.calibrate_microphone = cache.calibrate
+    try:
+        yield
+    finally:
+        v1.core.calibrate_microphone = original
 
 
 class SessionIdleTracker:
@@ -85,7 +141,7 @@ class SessionIdleTracker:
                 self._deadline = None
                 return
 
-            if state == "idle":
+            if state in {"idle", "waking", "calibrating"}:
                 self._deadline = None
                 return
 
@@ -187,53 +243,58 @@ async def wait_for_wake(uri, wake_word, microphone):
     return await wake.detect_once(uri, wake_word, microphone)
 
 
-async def run_realtime_until_idle(bridge, tracker):
+async def run_realtime_until_idle(bridge, tracker, calibration):
     """Run the proven v1 worker until it ends or the idle tracker expires."""
 
     tracker.start_session()
-    bridge.setState("thinking")
-    realtime_task = asyncio.create_task(v1.realtime_worker(bridge))
+    with cached_calibration(calibration):
+        realtime_task = asyncio.create_task(v1.realtime_worker(bridge))
 
-    try:
-        while True:
-            if realtime_task.done():
-                await realtime_task
-                return "runtime-ended"
+        try:
+            while True:
+                if realtime_task.done():
+                    await realtime_task
+                    return "runtime-ended"
 
-            if tracker.expired():
-                print("Conversation idle timeout: Realtime afsluiten.")
+                if tracker.expired():
+                    print("Conversation idle timeout: Realtime afsluiten.")
+                    realtime_task.cancel()
+                    try:
+                        await realtime_task
+                    except asyncio.CancelledError:
+                        pass
+                    return "idle-timeout"
+
+                await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
+        finally:
+            tracker.stop_session()
+            if not realtime_task.done():
                 realtime_task.cancel()
                 try:
                     await realtime_task
                 except asyncio.CancelledError:
                     pass
-                return "idle-timeout"
-
-            await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
-    finally:
-        tracker.stop_session()
-        if not realtime_task.done():
-            realtime_task.cancel()
-            try:
-                await realtime_task
-            except asyncio.CancelledError:
-                pass
 
 
-async def lifecycle_loop(uri, wake_word, microphone, tracker):
+async def lifecycle_loop(uri, wake_word, microphone, tracker, calibration):
     print(f"Project AVA v{VERSION}")
 
+    bridge = tracker.bridge
+    bridge.setState("calibrating")
+    calibration.prepare()
+    bridge.setState("idle")
+
     while True:
-        bridge = tracker.bridge
-        bridge.setState("idle")
         print("State: idle - lokaal wachten op 'Hey AVA'.")
 
         detected = await wait_for_wake(uri, wake_word, microphone)
         print(f"Wake accepted: {detected}")
+        bridge.setState("waking")
+        print("State: waking - Realtime sessie voorbereiden...")
         print("Starting proven AVA v1.0 Realtime session...")
 
         try:
-            reason = await run_realtime_until_idle(bridge, tracker)
+            reason = await run_realtime_until_idle(bridge, tracker, calibration)
             if reason == "runtime-ended":
                 print("Realtime session ended; wake word opnieuw bewapenen.")
         except Exception as error:
@@ -253,9 +314,11 @@ class LifecycleController(SessionIdleTracker):
         self.bridge = LifecycleBridge(self)
 
 
-def run_lifecycle_thread(uri, wake_word, microphone, tracker):
+def run_lifecycle_thread(uri, wake_word, microphone, tracker, calibration):
     try:
-        asyncio.run(lifecycle_loop(uri, wake_word, microphone, tracker))
+        asyncio.run(
+            lifecycle_loop(uri, wake_word, microphone, tracker, calibration)
+        )
     except Exception as error:
         print(f"AVA v1.1 lifecycle gestopt: {error}")
         tracker.bridge.setState("idle")
@@ -279,6 +342,7 @@ def main():
         followup_timeout=args.followup_timeout,
         speech_grace=args.speech_grace,
     )
+    calibration = CalibrationCache(args.microphone)
     bridge = tracker.bridge
     engine.rootContext().setContextProperty("avatarBridge", bridge)
 
@@ -294,7 +358,13 @@ def main():
 
     worker = threading.Thread(
         target=run_lifecycle_thread,
-        args=(args.wake_uri, args.wake_word, args.microphone, tracker),
+        args=(
+            args.wake_uri,
+            args.wake_word,
+            args.microphone,
+            tracker,
+            calibration,
+        ),
         daemon=True,
     )
     worker.start()
