@@ -10,6 +10,17 @@ if str(AVA_CORE) not in sys.path:
 import realtime_v11 as ava
 
 
+class DummyMemory:
+    def __init__(self, residence=None):
+        self.data = {"facts": []}
+        if residence:
+            self.data["facts"].append(f"ik woon in {residence}")
+        self.save_count = 0
+
+    def save(self):
+        self.save_count += 1
+
+
 class CalibrationCacheTests(unittest.TestCase):
     def test_prepare_calibrates_only_once(self):
         cache = ava.CalibrationCache("C270")
@@ -50,6 +61,75 @@ class CalibrationCacheTests(unittest.TestCase):
         self.assertEqual(result, (0.07, 0.09))
         self.assertEqual(cache._sample_rate, 44100)
         cache._original_calibrator.assert_called_once_with(7, 44100)
+
+
+class ResidenceMemoryGuardTests(unittest.TestCase):
+    @staticmethod
+    def replacing_processor(location):
+        def processor(transcript, memory):
+            changed = ava.v1._set_residence(memory, location)
+            return [
+                f"woonplaats aangepast naar {location}"
+                if changed
+                else f"woonplaats bevestigd: {location}"
+            ]
+
+        return processor
+
+    def test_casual_location_context_does_not_replace_existing_residence(self):
+        memory = DummyMemory("Hooglede")
+
+        actions = ava.guard_memory_processor(
+            "Ja, maar we zijn hier in Europa, ik woon in België.",
+            memory,
+            self.replacing_processor("België"),
+        )
+
+        self.assertEqual(ava.v1._residence_from_memory(memory), "Hooglede")
+        self.assertFalse(any(action.startswith("woonplaats ") for action in actions))
+
+    def test_explicit_residence_statement_can_replace_existing_residence(self):
+        memory = DummyMemory("Hooglede")
+
+        actions = ava.guard_memory_processor(
+            "Mijn woonplaats is Brugge.",
+            memory,
+            self.replacing_processor("Brugge"),
+        )
+
+        self.assertEqual(ava.v1._residence_from_memory(memory), "Brugge")
+        self.assertTrue(any("Brugge" in action for action in actions))
+
+    def test_first_residence_can_still_be_learned_from_plain_statement(self):
+        memory = DummyMemory()
+
+        ava.guard_memory_processor(
+            "Ik woon in Hooglede.",
+            memory,
+            self.replacing_processor("Hooglede"),
+        )
+
+        self.assertEqual(ava.v1._residence_from_memory(memory), "Hooglede")
+
+    def test_explicit_change_intent_recognises_now_and_move_phrasing(self):
+        self.assertTrue(ava.explicit_residence_change("Ik woon nu in Brugge."))
+        self.assertTrue(ava.explicit_residence_change("Ik ben verhuisd naar Gent."))
+        self.assertFalse(ava.explicit_residence_change("Ik woon in België."))
+
+    def test_session_patches_lower_voice_duration_and_restore_globals(self):
+        cache = ava.CalibrationCache("C270")
+        original_duration = ava.v1.core.MIN_VOICE_DURATION
+        original_processor = ava.v1.process_memory_request
+
+        with ava.v11_session_patches(cache):
+            self.assertEqual(
+                ava.v1.core.MIN_VOICE_DURATION,
+                ava.V11_MIN_VOICE_DURATION,
+            )
+            self.assertIsNot(ava.v1.process_memory_request, original_processor)
+
+        self.assertEqual(ava.v1.core.MIN_VOICE_DURATION, original_duration)
+        self.assertIs(ava.v1.process_memory_request, original_processor)
 
 
 class SessionIdleTrackerTests(unittest.TestCase):
