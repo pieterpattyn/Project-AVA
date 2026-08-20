@@ -32,6 +32,10 @@ class WakeWordProbeTests(unittest.TestCase):
         self.assertEqual(header["data"]["rate"], 16000)
         json.dumps(header)
 
+    def test_wake_stream_has_short_positive_warmup(self):
+        self.assertGreater(wake.WAKE_WARMUP_SECONDS, 0.0)
+        self.assertLessEqual(wake.WAKE_WARMUP_SECONDS, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
