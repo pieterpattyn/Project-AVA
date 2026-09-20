@@ -12,6 +12,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from software.ava_house.tapo_talk import CAMERA_HOSTS, speak_room
 
+CAMERA_HOSTS["living"] = "73.10.11.66"
+
 
 def register(ctx):
     schema = {
