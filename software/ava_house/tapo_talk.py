@@ -24,7 +24,10 @@ import re
 import secrets
 import socket
 import struct
+import subprocess
+import tempfile
 import time
+import shutil
 from dataclasses import dataclass
 
 TS_PACKET_SIZE = 188
@@ -357,6 +360,68 @@ def send_tone(client: TapoTalkClient, frequency: float, seconds: float, amplitud
         time.sleep(count / AUDIO_RATE)
 
 
+def send_pcm16le(client: TapoTalkClient, pcm: bytes) -> None:
+    """Send mono 8 kHz signed 16-bit little-endian PCM in real time."""
+    if len(pcm) % 2:
+        pcm = pcm[:-1]
+
+    mux = TapoTSMuxer()
+    client.send_mp2t(mux.header())
+
+    frame_bytes = 160 * 2  # 20 ms at 8 kHz, S16LE mono
+    for offset in range(0, len(pcm), frame_bytes):
+        frame = pcm[offset:offset + frame_bytes]
+        if not frame:
+            break
+        client.send_mp2t(mux.audio(pcm16le_to_pcma(frame)))
+        time.sleep((len(frame) // 2) / AUDIO_RATE)
+
+
+def edge_tts_to_pcm16le(text: str, voice: str) -> bytes:
+    """Generate Edge TTS speech and convert it to mono 8 kHz S16LE PCM."""
+    edge_tts = os.environ.get("EDGE_TTS_BIN") or shutil.which("edge-tts")
+    if not edge_tts:
+        hermes_edge_tts = "/home/hermes/.hermes/hermes-agent/venv/bin/edge-tts"
+        if os.path.exists(hermes_edge_tts):
+            edge_tts = hermes_edge_tts
+    if not edge_tts:
+        raise RuntimeError("edge-tts executable not found")
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg executable not found")
+
+    with tempfile.TemporaryDirectory(prefix="ava-tapo-tts-") as tmp:
+        mp3 = os.path.join(tmp, "speech.mp3")
+        subprocess.run(
+            [edge_tts, "--voice", voice, "--text", text, "--write-media", mp3],
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+        result = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                mp3,
+                "-f",
+                "s16le",
+                "-acodec",
+                "pcm_s16le",
+                "-ac",
+                "1",
+                "-ar",
+                str(AUDIO_RATE),
+                "pipe:1",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+        )
+        return result.stdout
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Send local talkback audio to a TP-Link Tapo camera")
     parser.add_argument("--host", required=True, help="Camera IP or hostname")
@@ -364,6 +429,8 @@ def main() -> int:
     parser.add_argument("--tone", type=float, default=650.0, help="Test tone frequency in Hz")
     parser.add_argument("--seconds", type=float, default=1.0)
     parser.add_argument("--amplitude", type=int, default=7000)
+    parser.add_argument("--text", help="Speak this text instead of a test tone")
+    parser.add_argument("--voice", default="nl-BE-DenaNeural", help="Edge TTS voice")
     args = parser.parse_args()
 
     password = os.environ.get("TAPO_CLOUD_PASSWORD")
@@ -374,8 +441,14 @@ def main() -> int:
     try:
         session = client.connect()
         print(f"AUTH OK, session {session}")
-        send_tone(client, args.tone, args.seconds, args.amplitude)
-        print("TESTTOON VERSTUURD")
+        if args.text:
+            print(f"TTS: {args.voice}")
+            pcm = edge_tts_to_pcm16le(args.text, args.voice)
+            send_pcm16le(client, pcm)
+            print("SPRAAK VERSTUURD")
+        else:
+            send_tone(client, args.tone, args.seconds, args.amplitude)
+            print("TESTTOON VERSTUURD")
         return 0
     finally:
         client.close()
