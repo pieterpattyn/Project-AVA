@@ -40,6 +40,10 @@ MPEGTS_CLOCK = 90_000
 AUDIO_RATE = 8_000
 PTS_MASK = (1 << 33) - 1
 
+CAMERA_HOSTS = {
+    "bureau": "73.10.11.64",
+}
+
 
 def _md5_text(*parts: str) -> str:
     return hashlib.md5(":".join(parts).encode()).hexdigest()
@@ -424,7 +428,9 @@ def edge_tts_to_pcm16le(text: str, voice: str) -> bytes:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Send local talkback audio to a TP-Link Tapo camera")
-    parser.add_argument("--host", required=True, help="Camera IP or hostname")
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--camera", choices=sorted(CAMERA_HOSTS), help="Configured camera name")
+    target.add_argument("--host", help="Camera IP or hostname")
     parser.add_argument("--port", type=int, default=8800)
     parser.add_argument("--tone", type=float, default=650.0, help="Test tone frequency in Hz")
     parser.add_argument("--seconds", type=float, default=1.0)
@@ -433,11 +439,13 @@ def main() -> int:
     parser.add_argument("--voice", default="nl-BE-DenaNeural", help="Edge TTS voice")
     args = parser.parse_args()
 
+    host = CAMERA_HOSTS[args.camera] if args.camera else args.host
+
     password = os.environ.get("TAPO_CLOUD_PASSWORD")
     if password is None:
         password = getpass.getpass("Tapo cloud password: ")
 
-    client = TapoTalkClient(args.host, password, port=args.port)
+    client = TapoTalkClient(host, password, port=args.port)
     try:
         session = client.connect()
         print(f"AUTH OK, session {session}")
