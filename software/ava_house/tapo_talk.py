@@ -365,10 +365,18 @@ def send_tone(client: TapoTalkClient, frequency: float, seconds: float, amplitud
         time.sleep(count / AUDIO_RATE)
 
 
-def send_pcm16le(client: TapoTalkClient, pcm: bytes) -> None:
-    """Send mono 8 kHz signed 16-bit little-endian PCM in real time."""
+def send_pcm16le(client: TapoTalkClient, pcm: bytes, preroll_ms: int = 500) -> None:
+    """Send mono 8 kHz signed 16-bit little-endian PCM in real time.
+
+    A short silent preroll gives the camera speaker/audio path time to wake up,
+    preventing the first word(s) from being clipped.
+    """
     if len(pcm) % 2:
         pcm = pcm[:-1]
+
+    if preroll_ms > 0:
+        silence_samples = int(AUDIO_RATE * preroll_ms / 1000)
+        pcm = (b"\x00\x00" * silence_samples) + pcm
 
     mux = TapoTSMuxer()
     client.send_mp2t(mux.header())
@@ -438,6 +446,12 @@ def main() -> int:
     parser.add_argument("--amplitude", type=int, default=7000)
     parser.add_argument("--text", help="Speak this text instead of a test tone")
     parser.add_argument("--voice", default="nl-BE-DenaNeural", help="Edge TTS voice")
+    parser.add_argument(
+        "--preroll-ms",
+        type=int,
+        default=500,
+        help="Silence before speech so the camera speaker can wake up",
+    )
     args = parser.parse_args()
 
     host = CAMERA_HOSTS[args.camera] if args.camera else args.host
@@ -462,7 +476,7 @@ def main() -> int:
         if args.text:
             print(f"TTS: {args.voice}")
             pcm = edge_tts_to_pcm16le(args.text, args.voice)
-            send_pcm16le(client, pcm)
+            send_pcm16le(client, pcm, preroll_ms=args.preroll_ms)
             print("SPRAAK VERSTUURD")
         else:
             send_tone(client, args.tone, args.seconds, args.amplitude)
