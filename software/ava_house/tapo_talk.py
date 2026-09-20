@@ -43,6 +43,7 @@ PTS_MASK = (1 << 33) - 1
 
 CAMERA_HOSTS = {
     "bureau": "73.10.11.64",
+    "living": "73.10.11.66",
 }
 
 
