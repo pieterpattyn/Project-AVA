@@ -22,6 +22,7 @@ import math
 import os
 import re
 import secrets
+from pathlib import Path
 import socket
 import struct
 import subprocess
@@ -442,6 +443,15 @@ def main() -> int:
     host = CAMERA_HOSTS[args.camera] if args.camera else args.host
 
     password = os.environ.get("TAPO_CLOUD_PASSWORD")
+    if password is None:
+        password_file = Path(
+            os.environ.get(
+                "TAPO_CLOUD_PASSWORD_FILE",
+                "~/.config/ava/tapo_cloud_password",
+            )
+        ).expanduser()
+        if password_file.is_file():
+            password = password_file.read_text(encoding="utf-8").rstrip("\r\n")
     if password is None:
         password = getpass.getpass("Tapo cloud password: ")
 
