@@ -435,6 +435,47 @@ def edge_tts_to_pcm16le(text: str, voice: str) -> bytes:
         return result.stdout
 
 
+def _load_tapo_password() -> str:
+    password = os.environ.get("TAPO_CLOUD_PASSWORD")
+    if password is None:
+        password_file = Path(
+            os.environ.get(
+                "TAPO_CLOUD_PASSWORD_FILE",
+                "~/.config/ava/tapo_cloud_password",
+            )
+        ).expanduser()
+        if password_file.is_file():
+            password = password_file.read_text(encoding="utf-8").rstrip("\r\n")
+    if password is None:
+        password = getpass.getpass("Tapo cloud password: ")
+    return password
+
+
+def speak_room(
+    room: str,
+    text: str,
+    *,
+    voice: str = "nl-BE-DenaNeural",
+    preroll_ms: int = 500,
+    port: int = 8800,
+) -> None:
+    """Speak text through the configured Tapo camera for a room."""
+    try:
+        host = CAMERA_HOSTS[room]
+    except KeyError as exc:
+        known = ", ".join(sorted(CAMERA_HOSTS))
+        raise ValueError(f"Unknown room/camera '{room}'. Known: {known}") from exc
+
+    password = _load_tapo_password()
+    client = TapoTalkClient(host, password, port=port)
+    try:
+        client.connect()
+        pcm = edge_tts_to_pcm16le(text, voice)
+        send_pcm16le(client, pcm, preroll_ms=preroll_ms)
+    finally:
+        client.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Send local talkback audio to a TP-Link Tapo camera")
     target = parser.add_mutually_exclusive_group(required=True)
@@ -456,18 +497,7 @@ def main() -> int:
 
     host = CAMERA_HOSTS[args.camera] if args.camera else args.host
 
-    password = os.environ.get("TAPO_CLOUD_PASSWORD")
-    if password is None:
-        password_file = Path(
-            os.environ.get(
-                "TAPO_CLOUD_PASSWORD_FILE",
-                "~/.config/ava/tapo_cloud_password",
-            )
-        ).expanduser()
-        if password_file.is_file():
-            password = password_file.read_text(encoding="utf-8").rstrip("\r\n")
-    if password is None:
-        password = getpass.getpass("Tapo cloud password: ")
+    password = _load_tapo_password()
 
     client = TapoTalkClient(host, password, port=args.port)
     try:
