@@ -13,6 +13,20 @@ if str(PROJECT_ROOT) not in sys.path:
 from software.ava_house.tapo_talk import CAMERA_HOSTS, speak_room
 
 
+ROOM_ALIASES = {
+    "woonkamer": "living",
+    "living": "living",
+    "bureau": "bureau",
+    "kantoor": "bureau",
+    "garage": "garage",
+    "bar": "bar",
+}
+
+
+def _normalize_room(room: str) -> str:
+    room = room.strip().lower()
+    return ROOM_ALIASES.get(room, room)
+
 
 def register(ctx):
     schema = {
@@ -41,7 +55,7 @@ def register(ctx):
 
     def handle_speak_room(params, **kwargs):
         del kwargs
-        room = str(params.get("room", "")).strip().lower()
+        room = _normalize_room(str(params.get("room", "")))
         text = str(params.get("text", "")).strip()
 
         if room not in CAMERA_HOSTS:
@@ -74,4 +88,83 @@ def register(ctx):
         toolset="ava_house",
         schema=schema,
         handler=handle_speak_room,
+    )
+
+
+    call_schema = {
+        "name": "ava_call_person",
+        "description": (
+            "Call or address a person aloud in a specific room through Project AVA. "
+            "Use this for requests such as 'roep Wies in de bar' or 'call Pieter in the garage'. "
+            "If no extra message is provided, speak the person's name clearly."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "room": {
+                    "type": "string",
+                    "enum": sorted(CAMERA_HOSTS),
+                    "description": "Room where the person should be called.",
+                },
+                "person": {
+                    "type": "string",
+                    "description": "Name of the person to call.",
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Optional extra message after the person's name.",
+                },
+            },
+            "required": ["room", "person"],
+        },
+    }
+
+    def handle_call_person(params, **kwargs):
+        del kwargs
+        room = _normalize_room(str(params.get("room", "")))
+        person = str(params.get("person", "")).strip()
+        message = str(params.get("message", "")).strip()
+
+        if room not in CAMERA_HOSTS:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Unknown room: {room}",
+                    "known_rooms": sorted(CAMERA_HOSTS),
+                }
+            )
+
+        if not person:
+            return json.dumps({"success": False, "error": "Person is required."})
+
+        spoken = f"{person}!"
+        if message:
+            spoken += f" {message}"
+
+        try:
+            speak_room(room, spoken)
+        except Exception as exc:
+            return json.dumps(
+                {
+                    "success": False,
+                    "room": room,
+                    "person": person,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+
+        return json.dumps(
+            {
+                "success": True,
+                "room": room,
+                "person": person,
+                "spoken": spoken,
+            }
+        )
+
+    ctx.register_tool(
+        name="ava_call_person",
+        toolset="ava_house",
+        schema=call_schema,
+        handler=handle_call_person,
     )
