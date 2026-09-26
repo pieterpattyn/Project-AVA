@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
@@ -167,4 +169,58 @@ def register(ctx):
         toolset="ava_house",
         schema=call_schema,
         handler=handle_call_person,
+    )
+
+
+    time_schema = {
+        "name": "ava_current_time",
+        "description": (
+            "Get the current local date and time. Use this for questions about the current "
+            "time, date, weekday, or 'now'. Defaults to Europe/Brussels for AVA's home."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "timezone": {
+                    "type": "string",
+                    "description": (
+                        "Optional IANA timezone such as Europe/Brussels or Asia/Shanghai. "
+                        "Omit for Europe/Brussels."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    }
+
+    def handle_current_time(params, **kwargs):
+        del kwargs
+        timezone = str(params.get("timezone", "")).strip() or "Europe/Brussels"
+        try:
+            now = datetime.now(ZoneInfo(timezone))
+        except ZoneInfoNotFoundError:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Unknown timezone: {timezone}",
+                }
+            )
+
+        return json.dumps(
+            {
+                "success": True,
+                "timezone": timezone,
+                "iso": now.isoformat(timespec="seconds"),
+                "date": now.strftime("%Y-%m-%d"),
+                "time": now.strftime("%H:%M:%S"),
+                "weekday": now.strftime("%A"),
+                "utc_offset": now.strftime("%z"),
+            }
+        )
+
+    ctx.register_tool(
+        name="ava_current_time",
+        toolset="ava_house",
+        schema=time_schema,
+        handler=handle_current_time,
     )
