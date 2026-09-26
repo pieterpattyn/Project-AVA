@@ -239,7 +239,7 @@ def main() -> int:
 
     bridge = AvaDesktopBridge()
     engine = QQmlApplicationEngine()
-    engine.rootContext().setContextProperty("avaDesktop", bridge)
+    engine.setInitialProperties({"avaDesktop": bridge})
 
     qml_path = Path(__file__).with_name("AvatarDesktop.qml")
     engine.load(QUrl.fromLocalFile(str(qml_path)))

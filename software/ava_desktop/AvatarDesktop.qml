@@ -14,6 +14,8 @@ Window {
     color: "#06090f"
     title: "AVA Desktop"
 
+    required property var avaDesktop
+
     property string avaState: avaDesktop.state
     property string rtxState: avaDesktop.rtxState
 
@@ -39,7 +41,7 @@ Window {
 
             Rectangle {
                 id: ambientGlow
-                anchors.centerIn: faceStage
+                anchors.centerIn: parent
                 width: 390
                 height: 390
                 radius: width / 2
