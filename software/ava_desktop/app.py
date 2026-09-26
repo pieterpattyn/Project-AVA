@@ -11,6 +11,7 @@ Voice/STT/Hermes conversation wiring is intentionally the next layer.
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import subprocess
@@ -30,6 +31,15 @@ LLM_HEALTH_URL = os.getenv("AVA_LLM_HEALTH_URL", "http://127.0.0.1:11434/api/tag
 WSL_DISTRO = os.getenv("AVA_WSL_DISTRO", "Ubuntu-24.04")
 STATUS_INTERVAL_MS = 2500
 HTTP_TIMEOUT_SECONDS = 0.7
+STT_TRANSCRIBE_URL = os.getenv(
+    "AVA_STT_TRANSCRIBE_URL",
+    "http://127.0.0.1:8000/v1/audio/transcriptions",
+)
+STT_MODEL = os.getenv("AVA_STT_MODEL", "Systran/faster-whisper-large-v3")
+STT_LANGUAGE = os.getenv("AVA_STT_LANGUAGE", "nl")
+AUDIO_SOURCE = os.getenv("AVA_AUDIO_SOURCE", "RDPSource")
+RECORD_SECONDS = os.getenv("AVA_RECORD_SECONDS", "5")
+AUDIO_FILE = os.getenv("AVA_AUDIO_FILE", "/tmp/ava-desktop-mic.wav")
 
 
 def _http_ok(url: str) -> bool:
@@ -78,9 +88,12 @@ class AvaDesktopBridge(QObject):
     statusTextChanged = Signal()
     busyChanged = Signal()
     errorTextChanged = Signal()
+    transcriptTextChanged = Signal()
 
     _statusProbeFinished = Signal(bool, bool)
     _controlFinished = Signal(bool, str)
+    _speechPhase = Signal(str)
+    _speechFinished = Signal(bool, str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -89,10 +102,13 @@ class AvaDesktopBridge(QObject):
         self._status_text = "Lokale AI controleren..."
         self._busy = False
         self._error_text = ""
+        self._transcript_text = ""
         self._probe_running = False
 
         self._statusProbeFinished.connect(self._apply_probe)
         self._controlFinished.connect(self._apply_control_result)
+        self._speechPhase.connect(self._apply_speech_phase)
+        self._speechFinished.connect(self._apply_speech_result)
 
         self._timer = QTimer(self)
         self._timer.setInterval(STATUS_INTERVAL_MS)
@@ -121,6 +137,10 @@ class AvaDesktopBridge(QObject):
     def errorText(self) -> str:
         return self._error_text
 
+    @Property(str, notify=transcriptTextChanged)
+    def transcriptText(self) -> str:
+        return self._transcript_text
+
     def _set_state(self, value: str) -> None:
         if value != self._state:
             self._state = value
@@ -145,6 +165,11 @@ class AvaDesktopBridge(QObject):
         if value != self._error_text:
             self._error_text = value
             self.errorTextChanged.emit()
+
+    def _set_transcript_text(self, value: str) -> None:
+        if value != self._transcript_text:
+            self._transcript_text = value
+            self.transcriptTextChanged.emit()
 
     @Slot()
     def refreshStatus(self) -> None:
@@ -222,14 +247,103 @@ class AvaDesktopBridge(QObject):
         QTimer.singleShot(400, self.refreshStatus)
 
     @Slot()
-    def demoListening(self) -> None:
-        """Temporary UI smoke-test until the voice loop is connected."""
+    def startListening(self) -> None:
+        if self._busy or self._state != "idle" or self._rtx_state != "local":
+            return
 
-        if self._state == "idle":
-            self._set_state("listening")
-            QTimer.singleShot(1800, lambda: self._set_state("idle"))
+        self._set_busy(True)
+        self._set_error_text("")
+        self._set_transcript_text("")
+        self._set_state("listening")
+
+        def worker() -> None:
+            audio_path = Path(AUDIO_FILE)
+
+            try:
+                audio_path.unlink(missing_ok=True)
+
+                recorded = subprocess.run(
+                    [
+                        "timeout",
+                        RECORD_SECONDS,
+                        "parecord",
+                        f"--device={AUDIO_SOURCE}",
+                        "--file-format=wav",
+                        str(audio_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+                if recorded.returncode not in (0, 124):
+                    message = (recorded.stderr or recorded.stdout).strip()
+                    self._speechFinished.emit(
+                        False, message or "Microfoonopname mislukt"
+                    )
+                    return
+
+                if not audio_path.is_file() or audio_path.stat().st_size < 1000:
+                    self._speechFinished.emit(False, "Geen bruikbare audio opgenomen")
+                    return
+
+                self._speechPhase.emit("thinking")
+
+                completed = subprocess.run(
+                    [
+                        "curl",
+                        "-sS",
+                        "--fail",
+                        STT_TRANSCRIBE_URL,
+                        "-F",
+                        f"file=@{audio_path}",
+                        "-F",
+                        f"model={STT_MODEL}",
+                        "-F",
+                        f"language={STT_LANGUAGE}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+
+                if completed.returncode != 0:
+                    message = (completed.stderr or completed.stdout).strip()
+                    self._speechFinished.emit(
+                        False, message or "Whisper-transcriptie mislukt"
+                    )
+                    return
+
+                payload = json.loads(completed.stdout)
+                transcript = str(payload.get("text", "")).strip()
+
+                if not transcript:
+                    self._speechFinished.emit(False, "Whisper hoorde geen tekst")
+                    return
+
+                self._speechFinished.emit(True, transcript)
+
+            except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+                self._speechFinished.emit(False, str(exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @Slot(str)
+    def _apply_speech_phase(self, state: str) -> None:
+        self._set_state(state)
+
+    @Slot(bool, str)
+    def _apply_speech_result(self, success: bool, text: str) -> None:
+        self._set_busy(False)
+
+        if success:
+            self._set_transcript_text(text)
+            self._set_error_text("")
         else:
-            self._set_state("idle")
+            self._set_error_text(text)
+
+        self._set_state("idle")
 
 
 def main() -> int:

@@ -236,11 +236,13 @@ Window {
                             id: talkButton
                             Layout.preferredWidth: 150
                             Layout.preferredHeight: 44
-                            text: root.avaState === "listening" ? "Luistert..." : "Praat"
+                            text: root.avaState === "listening"
+                                  ? "Luistert..."
+                                  : (root.avaState === "thinking" ? "Verwerken..." : "Praat")
 
                             enabled: root.rtxState === "local" && !avaDesktop.busy
 
-                            onClicked: avaDesktop.demoListening()
+                            onClicked: avaDesktop.startListening()
 
                             background: Rectangle {
                                 radius: 14
@@ -262,10 +264,14 @@ Window {
 
                         Text {
                             Layout.fillWidth: true
-                            text: root.rtxState === "local"
-                                  ? "Lokale AI beschikbaar"
-                                  : "AVA blijft zichtbaar; lokaal brein is uitgeschakeld"
-                            color: root.textMuted
+                            text: avaDesktop.transcriptText.length > 0
+                                  ? "“" + avaDesktop.transcriptText + "”"
+                                  : (root.rtxState === "local"
+                                     ? "Lokale AI beschikbaar"
+                                     : "AVA blijft zichtbaar; lokaal brein is uitgeschakeld")
+                            color: avaDesktop.transcriptText.length > 0
+                                   ? root.textMain
+                                   : root.textMuted
                             font.pixelSize: 13
                             elide: Text.ElideRight
                         }
